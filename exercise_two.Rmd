@@ -1,0 +1,149 @@
+---
+title: 'GSERM LDA: Exercise Two'
+output: github_document
+---
+
+The purpose of this exercise is to estimate and interpret various survival models, and compare conclusions from these models.
+
+The subject is leadership tenure. The data is time-varying, with observations on leader-years for 2990 leaders from 1875 to 2003. The total number of observations are 15 244. 
+
+The main dependent variables are tenurestart, tenureend and leftoffice. Leftoffice is the event indicator, indicating whether the relevant leader left office in the given year. There seems to be some rounding here. There are 2 821 events in the dataset, with an mean tenure of six and a half year. The median survial time in office is about 2 years. The various reasons for leaving office (from coups to elections to other stuff) are ignored for the purpose of the assignment.
+
+The independent variables are age, female, and five variables for world region (North America is the implicit reference category). A potentially important thing to note for the substantial interpretations is that while age vares from 11 to 93, with a mean of 55 years and a standard-deviation of 12 years, the gender-variable female indicates that female leaders comprise about 1 % of the observations. That is, the age-variable has a lot more variation than gender.
+
+```{r}
+#libraries
+library(dplyr) #data manipulation
+library(ggplot2) #plotting
+library(knitr) #table generation
+library(survival) #basic survival analysis
+library(eha) #parametric survival models
+library(psych) #solely for the describe-function
+library(broom) #data-tidying
+
+#parameters
+set.seed(1106)
+options(scipen=99)
+
+#data
+df <- read.csv("data/GSERM-Oslo-2019-ExTwo.csv", stringsAsFactors=FALSE)
+
+#fename = female
+names(df)[grep("fename",names(df),fixed=TRUE)] ="female"
+
+#descriptive statistics
+kable(describe(select(df,year,tenurestart,tenureend,leftoffice,age,female,LatinAm,Europe,Africa,Asia,MidEast),skew=FALSE),digits=2)
+
+#na_count <- data.frame(sapply(df, function(y) sum(is.na(y))))
+
+#some more manipulation
+#eha::phreg gets a hickup from negative tenurestart-times (if tenurestart <0, tenureend==0 and leftoffice==1, then you got yourself a negative duration). Add +1 to all - this has implications for interpretations
+sum(df$tenurestart<0)
+df = mutate(df,tenurestart_mod = tenurestart+1,tenureend_mod=tenureend+1)
+sum(df$tenurestart_mod<0)
+
+#there are 180 missing values in age - we'll replace those with means, for sake om completion
+df$age[is.na(df$age)==TRUE] = mean(df$age,na.rm=TRUE)
+#to make interpretation of age easy, we'll center age by mean
+df = mutate(df,age = age - mean(age,na.rm=TRUE))
+
+#basic survival curve 
+survival = Surv(df$tenurestart_mod,df$tenureend_mod,df$leftoffice)
+model_0 = survfit(survival~1,data=df)
+temp = tidy(model_0)
+
+ggplot(data=temp)+
+  geom_line(aes(x=time,y=estimate))+
+  geom_ribbon(aes(x=time,ymin=conf.low,ymax=conf.high),alpha=0.2)+
+  theme_minimal()+
+  labs(y="S(t)",title="Survival curve for leaders holding office")
+```
+
+#Parametric models
+To estimate a parametric model, I need to specify both a model of covariates and a distribution function for the hazard rates: do we assume that the risks of failiure at any given point rises, falls or exhibit other trends over tenure time - conditional on the covariates included in the model? The last part of the sentence is important: it implies that I need to think a baseline hazard after drawing out hazard-rate variations between genders, ages, world region and any interactions between world region and gender.
+
+One potentially reasonable hazard-rate distribution might be that the hazard is rising at first, but after some amount of duration, it could fall: the risk of leaving office is larger at first, and grows as one approaches election-type durations, but then falls as one approaches more autocratic modes of leadership. The degree of democracy is not a part of the model. This could suggest something like a log-normal or log-logistic distribution. 
+
+Such a model can be fit with eha::phreg - or at least in theory, as it yields rather cryptic error codes for the log-normal distribution. The help-page also indicates that this is an experimental feature. the log-logistic estimation seems to work though. I and assume for the sake of this excerice that the coefficients can be interpreted. That is, I assume correct calculations, but not necessarily correctly specified distribution function.
+
+I include all the independent varibles, and a squared age-term, as the effects of age often turn up to be of this kind.
+
+```{r}
+#as per the documentation, arrangement of observations does matter for eha::phreg-estimation.
+df = arrange(df,leadid)
+
+model_parametric = phreg(survival~age+I(age^2)+female+LatinAm+Europe+Africa+Asia+MidEast,
+                         data=df,dist="loglogistic",center=FALSE)
+#phreg is not AFT-form
+
+summary(model_parametric)
+#plot(model_parametric)
+```
+
+As we can see, neither age, gender nor Latin-America. That is, males do not have a statistically significantly different hazard rate than females, older leaders have no different hazard than younger people, and Latin-American leaders do not have a different leadership hazard than their North-American colleagus.
+
+The coefficients for Europe, Africa, Asia and the Mid-East are statistically significant. Being a Europan leader increases the hazard of leaving office by 23 %, compared to a North-American leader. Being a leader from Africa, Asia or the Middle-East on the other hand decreases the hazard of leaving office. 
+
+#Cox's proportionate hazards model
+We then take a look at the semi-parametric Cox's proportional hazards model. As Cox does not assume a distribution of the hazard, only the proportionality of said hazards, we can get around misspecifying the baseline hazard. 
+
+The exact-method is preferred for handling ties in cases with actual discrete data - that is, where the events actually take place in the same years. This method is, however, rather computationally intensive, and keeps crashing my computer. As such, we'll go with the default-method of Efron.
+
+```{r}
+model_cox = coxph(survival~age+I(age^2)+female+LatinAm+Europe+Africa+Asia+MidEast,
+                  data=df, ties = "efron")
+summary(model_cox)
+tabell_cox = tidy(model_cox)%>%
+  mutate(.,exp_estimate = exp(estimate))
+
+kable(tabell_cox,digits=2)
+
+#also put in a (smooth?) estimate of the hazard-curve from these data?
+```
+
+We quickly see that the same variables are statistically significant in this model as in the last: Leaders from Europe, Africa, Asia and the Middle East probably have different hazards from leaders from North America. The European leaders have a higher hazard, while the other ones have lower hazards. The differences in hazards ranges from 3 to 5 percentage points.
+
+- Leaders in Europe have 23 % (parametric) vs. 18 % (cox) higher hazard rate than North America
+- Leaders in Asia have 25 % (parametric) vs. 29 % (cox) lower hazard rate than North America
+- Leaders in Africa have 29 % (parametric) vs. 32 % (cox) lower hazard rate than North America
+- Leaders in the Middle East have 32 % (parametric) vs. 36 % (cox) lower hazard rate than North America
+
+#Discrete-time-models
+Discrete time-models are Generalized Linear Model-based approaches. As opposed to the survival models above, such a model must deal with time-dependence explicitly - unless you assume a flat hazard. 
+
+There are various ways of dealing with such issues. As I briefly assumed for the section on parametric surival models, a curvilinear trend of leaving office over time might be reasonable. Other approaches could be including dummy-variables for time. With 164 timepoints, this would prove rather hard to interpret.
+
+```{r}
+#baseline glm, flat hazard
+model_glm0 = glm(leftoffice~age+I(age^2)+female+LatinAm+Europe+Africa+Asia+MidEast,
+                  data=df, family="binomial")
+summary(model_glm0)
+
+#some linear trend of tenureend 
+#model_glm1 = glm(leftoffice~age+I(age^2)+female+LatinAm+Europe+Africa+Asia+MidEast+tenureend,
+#                  data=df, family="binomial")
+#summary(model_glm1)
+
+#curvilinear trend
+model_glm2 = glm(leftoffice~age+I(age^2)+female+LatinAm+Europe+Africa+Asia+MidEast+tenureend+I(tenureend^2),
+                  data=df, family="binomial")
+summary(model_glm2)
+
+#model test
+test_curves = anova(model_glm0,model_glm2, test="Chisq")
+test_curves
+kable(tidy(test_curves),digits=2)
+
+#coefficients from model_glm2
+tabell_glm = tidy(model_glm2)%>%
+  mutate(.,estimate_or = exp(estimate),estimate_p = exp(estimate)/(1+exp(estimate)))
+kable(tabell_glm,digits=2)
+
+#consider some other time-type-things. clustering on a variable?
+```
+
+The analysis of deviance indicates that the model including the time-varying coefficients are the better one. 
+
+So how does these results compare to those above? Well, some more coefficient estimates are statistically significant. Both age and Europe have turned significant. 
+
+Interpreting the coefficients as odds ratios, we see that a 1 unit increase in age increases the odds of leaving office slightly. Beeing a leader in Europe again increases the odds of leaving office compared to North America, while the leaders in Africa, the Middle Easst and Asia all have lower odds of leaving office. The directions of the coefficients are thus the same as in the parametric model and the Cox-model.

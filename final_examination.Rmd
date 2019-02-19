@@ -1,0 +1,205 @@
+---
+title: 'GSERM LDA: Final Examination'
+output: github_document
+---
+
+In this paper, I will answer Question two of the FINAL EXAM: On up to 7-8 pages, use text, graphs, tables, etc. to answer the following questions: Reestimate and re-evaluate GRMs analyses of post-civil peace duration, using their data. I am not to replicate the original article, but to reconsider their findings regarding four types of measured mediation.
+
+Admin:
+- deliver as a PDF. That is, spend some time on formatting.
+- also deliver all computer output and all code used to generate your findings.
+- take the MVP-approach here, make sure not to get bogged down by early questions. 2, 3 and 4 are the meat of the game. 
+
+```{r}
+#libraries
+library(here)
+suppressPackageStartupMessages(library(tidyverse))
+library(survival)
+library(knitr)
+library(survminer)
+
+#some parameters
+theme_set(theme_minimal())
+```
+
+#1. Briefly describe the survival data
+The data comes from Gurses, Rost and McLeod (2016) Mediating Civil War Settlements and the Duration of Peace (GRM from now on).
+
+```{r}
+#data
+df <- read.csv(here("data","GSERM-Oslo-2019-Exam-Q2-Data.csv"), stringsAsFactors=FALSE)
+```
+
+It is a total of 1 357 observations of 24 variables. The dataset has 55 countries. The first year a country is observed is recorded in "origin" (might also be that this is the origin of peace-year). Each country then has an observation per country-year until the recurrence of a civil war (our event of interest) or censoring. Failed (and d) records the recurrence of civil war. If a new peace then emerges, the observations continue."d" is the censoring indicator, more properly thought of as an event indicator: it is 1 if the event happens, and 0 otherwise. There are 23 recurrences of civil war.
+
+The dependent variable is number of years the peace last after the end of a civil war. PeaceStart is the year the peace started, PeaceEnd is the year the peace ended for that year. The event here is civil war recurrence. t0 and t is a legacy-variable from STATA indicating start and stop, which seems to count the number of start and stops of Peace.
+
+Since PeaceStart and PeaceEnd always start with a constant PeaceStart-year, I assume that the correct observational timepoints are t0 and t.
+
+```{r}
+#base_model = survfit(Surv(PeaceStart,PeaceEnd,event=d)~1,data=df)
+
+base_model = survfit(Surv(t0,t,event=d)~1,data=df)
+temp = broom::tidy(base_model)
+
+ggplot(data=temp)+
+  geom_line(aes(x=time,y=estimate))+
+  geom_ribbon(aes(x=time,ymin=conf.low,ymax=conf.high),alpha=0.1)+
+  geom_point(aes(x=time,y=estimate,alpha=n.censor>0))+
+  labs(title="Kaplan-Meier curve for surviving peace treaty")+
+  theme(legend.position ="none")
+
+#some wrangling to get at event-count and possible ties
+temp = select(df,PeaceStart,PeaceEnd,Failed)%>%
+  filter(.,Failed==1)%>%
+  group_by(.,PeaceEnd)%>%
+  summarise(.,n=sum(Failed))
+temp2 = data.frame(Year=1940:2000)%>%
+  left_join(.,temp,by=c("Year"="PeaceEnd"))
+
+temp2$n[is.na(temp2$n)]=0
+
+qplot(x=Year,y=n,data=temp2,geom="col")+
+  labs(title="Event count by year")
+
+```
+
+The survial curve indicates a falling rate of survival for the first years of a peace agreement, with some plateaus here and there, before it stabilizes after about 25 years. That is, if a peace agreement survives 25 years, the odds of surviving even longer is stable. 
+
+##independent variables (might be dropped)
+The 13 predictors used by GRM are described in the article. Many of the variables relate to the last ended civil war, and as such are time-invariant for the duration of the peace. The variables measuring GDP per capita and military strength are time-varying covariates - which induces certain kinds of problems.
+
+- Mediated Agreement (MediatedAgreemt): 1 if the final peace agreement was mediated
+- Mediation (Mediation): 1 if there was a mediation attempt during the last year of the civil war
+- Super Power Mediation (SuperpowerMediation): 1 if there was a mediation attempt by a super-power
+- Total number of mediation attempts(TotalNofMedAttempts): the number of such attempts during the civil war
+- UN Peacekeeping (UNPeacekeeping): ordinal variable, degree of UN involvement, from 4) enforcement missing, 3) peacekeeping missions, 2) observer missions, 1) mediations, 0) no peacekeeping missions
+- Ethnic war (EthnicWar): 1 if the war was over ethnic, religious or other ascribed characteristics
+- Log of total deaths(LogTotalDeaths): natural log  of deaths in the civil war
+- war duration (WarDuration): the length of the civil war in years
+- military victory ((MilitaryVictory): 1 if the war ended in a one-sided military victory, 0 is a negotiated settlement
+- democracy (Democracy): POLITY autocracy-democracy score, from -10 fully autocracti to 10 fully democratic
+- log of GDP(lnGDP): natural log of countrys GDP per capita, in constant 1985 US dollars
+- log of army size(LogArmySize): log of troop counts
+- war counts(WarCount): number of civil wars the country experienced during this period.
+
+There are also some ID-variables, identifying countryCode, CountryName. Unaccounted for: st: a constant of 1? ID?
+
+```{r}
+#consider adding something here for the independent variables.
+kable(psych::describe(select(df,Failed:WarCount),skew=FALSE),digits=2)
+```
+
+#2. Specify and estimate one or more survival models
+The goal is to compare the duration of peace after mediated agreements with the duration of peace after non-mediated agreements. Does mediated peaces have a higher or lower hazard rate, are they more or less likely to survive?
+
+The general choice is between a parametric and a semi-parametric survival model. GRM uses both of these, a Weibull-model and a Cox-model. I focus on a Cox-model. The baseline hazard rate for recurrence of civil war after a civil war is unknown, and as such the semi-parametric models allows me to draw inferences without pre-specifying a distribution.
+
+This does not, however, allow for easily made predictions - which seems like a good motivation for styding this type of subject matter. An added pragmatic reason is that the lectureres specified that parametric models for time-varying data are pretty poorly implemented in R, which is the statistical programming language I am currently using.
+
+For handling ties, I apply the Efron approximation. The assumption behind this approximation is that the recurrence of civil war is some continous process that might happen in any of the years. One might argue that as we observe the events only in years, an alternative approach would be to consider the event as happening at discrete times. As the number of years are quite large,  I go with the continous approximation. Furthermore, as we only have five years were two peaces are broken, the choice of tie-breaker should not have much of an effect. 
+
+To handle correlation of observations within the same country, I fit a separate model that estimates robust sandwich variance estimators for country-level variance.
+
+```{r}
+surv_object = Surv(df$t0,df$t,event=df$d)
+
+modell_0 = coxph(surv_object~MediatedAgreemt+Mediation+SuperpowerMediation+TotalNofMedAttempts+UNPeacekeeping+EthnicWar+LogTotalDeaths+WarDuration+MilitaryVictory+Democracy+lnGDP+LogArmySize+WarCount,
+                 data=df,
+                 ties="efron"
+                 )
+
+summary(modell_0)
+
+
+modell_1 = coxph(surv_object~MediatedAgreemt+Mediation+SuperpowerMediation+TotalNofMedAttempts+UNPeacekeeping+EthnicWar+LogTotalDeaths+WarDuration+MilitaryVictory+Democracy+lnGDP+LogArmySize+WarCount+cluster(CountryCode),
+                 data=df,
+                 ties="efron"
+                 )
+
+summary(modell_1)
+
+kable(broom::tidy(modell_0),digits=2)
+kable(broom::tidy(modell_1),digits=2)
+
+```
+
+I included all the same independent variables as GMR. 
+
+#3. The association between mediaton and the hazard of civil war recurrence
+The exponentiated coefficients are what we are interested in here, as they are interpreted as hazard ratios. That is, having a 1 unit larger army, decreases the hazard of a recurrence of a ciwil war by about 35 %. On the other hand, if the last conflict was an ethnic war (as defined by GRM), that increases the hazard of a recurrence of a civil war by about 400 %. Note that this is relative judgements, and says nothing about the absolute risk of a recurrent war.
+
+So, as we can see from the model, none of the main variables of interest are statistically significant. That is, we cannot be sure that the estimated effects are different from 0. Neither a mediation during the last year of the war, a super-power mediation attempt, a mediated peace agreement, a larger amount of mediation attempts or involvement by the UN has an effect.
+
+```{r}
+#compare survival curves
+simulated_data = data.frame(
+  MediatedAgreemt = c(1,0,0,0),
+  Mediation = c(0,1,0,0),
+  SuperpowerMediation = c(0,0,1,0),
+  UNPeacekeeping = c(0,0,0,1),
+  TotalNofMedAttempts = rep(mean(df$TotalNofMedAttempts),4),
+  EthnicWar = rep(1,4),
+  LogTotalDeaths = rep(mean(df$LogTotalDeaths),4),
+  WarDuration = rep(mean(df$WarDuration),4),
+  MilitaryVictory = rep(1,4),
+  Democracy = rep(mean(df$Democracy),4),
+  lnGDP = rep(mean(df$lnGDP),4),
+  LogArmySize = rep(mean(df$LogArmySize),4),
+  WarCount = rep(mean(df$WarCount),4)
+)
+
+model_simulated_1 = survfit(modell_1,simulated_data)
+plot(model_simulated_1,conf.int=TRUE,col=c(1,2,3,4),pch=c("Mediated agreement","Meditation","Superpower","UN"))
+```
+(labeling failed here, so: Mediated agreement: Black; Mediation: Red; Superpower: Green; UN:Blue)
+
+If we take a brief look at some averaged out data, where the only thing that varies is the mediation agreement, we can clearly see how broad the confidence intervals are. Mediation in red seems to be the only one who does not in fact encompass all other estimates of peace survival time - but is then, of course, included in all the confidence intervals for all the other survival curve estimates.
+
+[Some more stuff here!]
+
+#4. Post-estimation diagnostics and robustness checks
+So, for the Cox proportional hazards model, the central assumption is the proportionality of the hazards. There are two ways to test this: 
+
+- formally, through a test of whether the effects stay proportionate over time, or
+- graphically, examining pseudo-residuals over the time period.
+
+The function cox.zph calculates Shoenfeld residuals scaled with time. If the relationship between the various variables and time are insignificant, the assumption holds. A significant relationship indicates a broken assumption 
+```{r}
+test_1 = cox.zph(modell_1)
+kable(print(test_1),digits=2)
+```
+
+We can also plot these residuals over time:
+
+```{r}
+#mediation related variables
+ggcoxzph(test_1,var="MediatedAgreemt")
+ggcoxzph(test_1,var="Mediation")
+ggcoxzph(test_1,var="SuperpowerMediation")
+ggcoxzph(test_1,var="UNPeacekeeping")
+ggcoxzph(test_1,var="TotalNofMedAttempts") 
+
+#the statistically significant variables
+#ggcoxzph(test_0,var="EthnicWar") #no effect
+#ggcoxzph(test_0,var="LogTotalDeaths")
+#ggcoxzph(test_0,var="LogArmySize")
+
+#other independent variables
+#ggcoxzph(test_0,var="WarDuration")
+#ggcoxzph(test_0,var="MilitaryVictory")
+#ggcoxzph(test_0,var="Democracy")
+#ggcoxzph(test_0,var="lnGDP")
+#ggcoxzph(test_0,var="WarCount")
+```
+
+Plotting all of them would be a bit much. Looking at the coefficient of whether the agreement was mediated, we see a curvilinear trend over time. The same for medition and superpower mediation. That could indicate that the effects are varying with time. But as the actual number of observations of recurrence are quite low, and the general test statistic insignificant, it is hard to say whether this is an actual problem.
+
+[More on time here]
+
+#5. Might an extension be more approproatie? 
+There were three kinds of extensions discussed in class: cure models, frailty models and multilevel-models.
+
+Appropiate for the data. As we could see from the base survival curve of a peace agreement, the survival rate flattens out after 25 years. This could potentially indicate that there is a cure for civil war somewhere to be found, in which case a cure model could be appropriate - or at least potentially interesting for additional insights.  
+
+The main concern, though, seems to be with the amount of data one has. The recurrence of civil war is, luckily, a rather rare phenomenon - at least for the time period under study. 

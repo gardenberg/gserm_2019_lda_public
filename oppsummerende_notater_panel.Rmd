@@ -1,0 +1,954 @@
+---
+title: "Longitudinel dataanalyse - variasjon i tid og rom"
+output: github_document
+---
+
+Dette er et sammendrag av kurset "Longitudinal Data Analysis", arrangert av GSERM på BI i Oslo januar 2019. Slides, data m.m. lå under kurset ute på [Christopher Zorns github-repo](https://github.com/PrisonRodeo/GSERM-Oslo-2019-git). Data og kodeeksempler lenger ned er basert på hans kode. 
+
+Dette er delen som tar for seg analyse av paneldata. Den andre delen tar for seg tid-til-hendelse-analyse.
+
+```{r}
+#biblioteker
+library(knitr)
+suppressPackageStartupMessages(library(tidyverse))
+library(plm)
+library(lme4) #paneldata-pakkene skjuler enkelte ordne-funksjoner i tidyverse-pakker
+library(lmtest) #maskerer as.Date og as.Date.numeric
+library(prais)
+library(nlme)
+library(rms)
+library(glmmML)
+library(geepack)
+library(car)
+
+#innstillinger
+set.seed(1106)
+options(scipen = 99) #aldri vitenskapelig notasjon
+options(digits = 2) #generelt sett færre desimaler
+
+```
+
+#Hva er longitudinelle data, og hvordan snakke om det?
+Longitudinelle data er data hvor du har observasjoner av ulike enheter (fra 1 til N) over tid (fra 1 til T tidspunkter). Det kan f.eks. være en jevnlig gjennomført spørreundersøkelse, eller informasjon om alle norske kommuner over tid. Et eksempel kan f.eks. se slik ut:
+
+```{r}
+df = read.table("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/tinyTSCSexample.txt", header=TRUE)
+kable(df,digits=2)
+```
+Dette er leke-data, som viser data for 3 enheter målt i 1998, 2000, 2002 og 2004. Hver enhet har 
+
+- en tidsinvariant egenskap: kjønn (koda som female her),
+- en egenskap som deles på tvers av enhet: den sittende presidenten,
+- en egenskap som endrer seg sakte eller lite over tid: partiidentifikasjon,
+- en egenskap som endrer seg en del over tid, og som antakeligvis samvarierer både med tidsbestemte hendelser og partiidentifikasjon.
+
+Et av hovedpoengene i kurset ser ut til å være alle utfordringene man støter på hvis man bruker longitudinelle data. Mange av antakelsene man må gjøre for å kjøre en standard regresjonsmodell med OLS mister all troverdighet når en får data på både tid og sted. 
+
+Men hvis du i stedet for å utnytte de longitudinelle dataene gjør en form for aggregering, enten ved å se på snittet for personer over tid - eller snittet for år over personer - så går du raskt i ei anna felle: du mister informasjon, skjuler potensielt viktige sammenhenger og gjør at du må ta litt tilfeldige valg om hvordan ting skal kodes og regnes. Se på disse eksemplene:
+
+```{r}
+agg_crossection = group_by(df,ID)%>%
+  mutate(female = as.numeric(Female))%>%
+  mutate(gop_pid = as.numeric(PID))%>%
+  summarise(male = (mean(female)-1), gop_pid = (mean(gop_pid)-1), approve = mean(Approve))
+kable(agg_crossection, digits = 2)
+
+agg_timeseries = group_by(df,Year)%>%
+  mutate(female = as.numeric(Female))%>%
+  mutate(gop_pid = as.numeric(PID))%>%
+  summarise(male = (mean(female)-1), gop_pid = (mean(gop_pid)-1), approve = mean(Approve))
+kable(agg_timeseries, digits = 2)
+rm(agg_timeseries,agg_crossection)
+```
+
+Det første eksempelet er en aggregering av individer over tid. Det andre eksempelet er aggregering over tid. Jeg har ikke så stor sans for slike leke-eksempler, og lar det ligge slik.
+
+##Så hvordan snakker en om longitudinelle data?
+
+- Hvis N er en god del større enn T, kalles det paneldata. 
+- Hvis T er om lag like stor som N, eller større, har en "time-series cross-section" / TSCS-data, kanskje oversettbart til "tidsserie med tverrsnittdata" på norsk.
+
+Hvorfor skille mellom disse to? Noen av estimeringsmetodene oppfører seg ulikt for situasjoner med N større enn T og omvendt. I mange tilfeller kan det også si noe om hva en ønsker å gjøre slutninger til: for paneldata kan det gjerne dreie seg om et utvalg fra en større populasjon N (f.eks. spørreundersøkelse). For tidsserier med tverrsnittdata kan man ha hele populasjonen som N, men kanskje ønske å si noe om utviklinga over tid (f.eks. alle OECD-land).
+
+Enheter som observeres indekseres gjerne med i, mens tidspunkter for observasjoner gjerne indekseres med t. Hvis en har observasjoner for alle T for alle N, har en et balansert panel. I et balansert panel er totalt antall observasjoner N*T.
+
+#Variasjon mellom enheter og variasjon innad i en enhet 
+Det er ulike kilder til variasjon i longitudinelle data. Hovedskillet går mellom 
+- variasjonen som er mellom ulike enheter (between-unit variation), og 
+- variasjonen innad i en enhet over tid (within-unit variation).
+
+En måte å tenke rundt dette på er ved å se på gjennomsnittet over tid for en variabel Y(i). Den totale variasjonen i Y(it) er gitt av snittet for Y(i), pluss variasjonen rundt dette snittet på hvert tidspunkt t.
+
+Et eksempel kan kanskje hjelpe: Her er eksempeldata fra Zorn på dommere i den amerikanske høyesteretten. Data er på 107 dommere, antall år de har tjenestegjort i Høyesterett, hvorvidt de har pensjonert seg eller trukket seg, alder - og en variabel pagree som ikke er forklart.
+
+Det vi er interessert i er variasjonen i antall år tjenestegjort. Først ser vi på total variasjon:
+
+```{r}
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/scotus.csv", header=TRUE)
+
+kable(psych::describe(df$service,skew=FALSE,range=TRUE),digits=1)
+```
+I de 1765 observasjonene vi har, er gjennomsnittlig tjenestelengde på nesten 12 år, fra minimum 1  til maksimum 37. Standardavviket er 8 år. Dette ser på variasjonen mellom alle observasjoner - både mellom ulike dommere, samme dommer i ulike år, og ulike dommere i ulike år.
+
+Hva er så variasjonen mellom enheter? Her tar vi snittet over tid.
+
+```{r}
+between_scotus = group_by(df,justice)%>%
+  summarise(.,service = mean(service))
+
+kable(psych::describe(between_scotus$service,skew=FALSE,range=TRUE),digits=1)
+
+```
+Blant de 107 dommerne, er gjennomsnittet 9 års tjeneste, med 5 års standardavvik - fra 1,5 år til 21 år maks.
+
+Hvis vi så heller ser på variasjonen innad i hver enkelt dommer? 
+
+```{r}
+within_scotus = group_by(df,justice)%>%
+  mutate(.,servmean = mean(service),within = service-servmean)
+
+kable(psych::describe(within_scotus$within,skew=FALSE,range=TRUE),digits=1)
+```
+Dette er variasjon rundt snitter for den enkelte enhet - i dette tilfellet den enkelte dmmer. Gjennomsnittet er 0, standardavviket nesten 7 år, og min-maks fra -18 til +18 år - noe som gir mening når vi tenker på at den lengste tjenestetida er 36/37 år.
+
+#Regresjonsanalyse av longitudinelle data
+En standard regresjonslikning har en rekke antakelser. Det samme gjelder når en skal kjøre regresjon på longitudinelle data - men med noen tillegg for den ekstra dimensjonen T.
+
+(ta en sjekk av disse tingene i pensum!)
+- feilleddet u(it) er identisk og uavhengig normalfordelt for alle i og for alle t
+- variasjonen i feileddet er identisk på tvers av observasjoner i (ingen heteroskedastisitet på tvers av enheter). Dvs. at modellen passer like godt for alle enheter på et gitt tidspunkt t.
+- variasjonen i feilleddet er identisk på tvers av tid t (ingen heteroskedastisitet på tvers av tid). Det vil si at modellen passer like godt for en gitt enhet i på tidspunkt t og t+1.
+- det er ingen kovariasjon mellom feilleddet over tid t eller enhet i - en feil for u(it) er ikke informativ for en feil u(js) (utover at de er identiske...?) - altså ingen autokorrelasjon eller spatiell korrelasjon.
+
+Dette er selv med standard tverrsnittdata ganske kraftige antakelser. 
+
+En antakelse som ikke ofte blir nevnt er antakelsen om konstante effekter av b0 og bXi for alle i og for alle t. Dvs. at "intercept"/skjæringspunktet/konstantleddet er lik , og at koeffisienten er lik. 
+
+En rimelig antakelse for mye longitudinelle data er at den korrekte modellen er unike skjæringspunkt for hver i, eller for hver t, eller for hver i og t. Ulike enheter har ulike gjennomsnittlige verdier.
+
+[Kunne ha lagt inn et eksempel her - eller i hvert fall et bilde?]
+
+En variant av dette er at det er variasjon i koeffisientene / slopes, der bXi varierer for i eller t: Altså at effekten av X på Y er forskjellig for ulike enheter, eller på ulike tidspunkt. F.eks. at effekten av skatteøkninger er en annen for land A enn for land B. Eller at effekten av kontakt med innvandrere er annerledes for ulike personer i en panelundersøkelse.
+
+Ikke å hensynta dette gir en feil spesifisert modell, som kan være en av de mest alvorlige feilene for modellering.
+
+##Så når bør data pooles? Og når må en gjøre noe annet?
+Å analysere dataene samlet kalles "pooling". Det ligger gjerne substansielle betraktninger bak en avgjørelse om å poole observasjoner: når gir det mening for modellen å slå sammen ekorn og mennesker? Eller 1900 og 2019? 
+
+(Slide 22 gir standard-formel for B og Var i matriserammeverket)
+
+Svaret er når de er like (nok). En kan gjøre en F-test, for å se om to modeller er forskjellig fra en modell (Bartels har utviklet dette - se nærmere på hva dette faktisk er, og hvordan det kan gjøres i praksis. Hva er intuisjonen? Hvilken form for pooling er det dette skal se nærmere på?).
+
+Bartels foreslår en "fractional pooling" som en sensitivitetstest, der lamda-parameteren gir en vekt på hvordan du vekter de ulike kildene til variasjon - hvor mye A-data inkluderes? (Sjekk for å finne ut hva dette faktisk er, helt konkret).
+
+Selv med sensitivitetstest, er dette gjerne en avgjørelse som krever domene-kunnskap.
+
+#En-vei enhetseffekter - random og fixed effects
+Toveisvariasjon (two-way unit variation, effects): variasjon i tid for noen variabler, og variasjon over enheter for andre variabler.
+
+Hvis alle enheter er unike, men konstant unike over tid, kan en legge til et feilled alphai - alle er konstant litt forskjellige. Det samme kan gjøres for variasjon over tid: hvert år er litt annerledes for alle i. 
+
+En vanlig antakelse er at effektene man er interessert i er enten over tid eller over enheter, og at en dermed ikke trenger å modellere begge variasjonskilder (dette høres ikke riktig ut - er ikke poenget med paneldata at en har begge kilder til variasjon? Hva er intuisjonen bak her? Er det kanskje feilledettet en snakker om? Niet?). Dette er enhetseffekter.
+
+##Fixed effekts er within-effects
+Den brutale metoden her er å inkludere dummy-variabler for det du er interessert i å holde konstant. Men denne modellen kan formuleres på en annen, og potensielt mer informativ måte: som within effects-modellen. Når du inkluderer en dummy-variabel per enhet, benytter du kun variasjonen innad i enheter over tid. Gitt en konstant effekt av en enhets unikhet, hva er effekten av x på y for denne enheten?
+
+Er dette en rimelig modell? Det kan besvares med en standard F-test av modellen med og uten slike faste konstantledd/skjæringspunkt.
+
+Slide 32 - 36 har eksempel, med data på flyktningestrømmer mellom to land i Afrika 1992-2001. Dvs. hver observasjon er en rekke egenskaper for en dyade - forholdet mellom to land.
+
+Vi kan bruke en standard lineær modell som referanse-modell:
+
+```{r}
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/Refugees.csv",header=TRUE)
+
+ref_ols = lm(ln_ref_flow~pop_diff+distance+regimedif+wardiff,data=df)
+summary(ref_ols)
+```
+
+```{r}
+summary(select(df,year,ln_ref_flow,pop_diff,distance,regimedif,wardiff))
+
+ref_fe = plm(ln_ref_flow~pop_diff+distance+regimedif+wardiff,
+             data=df,effect="individual",model="within")
+```
+Når vi estimerer en within-effects modell her, ser vi bl.a. at 
+
+- konstantleddet / skjæringspunktet blir borte, ettersom en får et konstantledd per enhet, med gjennomsnitt 0.
+- tidsinvariante variabler droppes, fordi disse oppsummeres og kontrolleres av det individspesifikke konstantleddet. Det innebærer også at disse variablene får en bedre spesifisering enn den ville gjort manuelt, ettersom en ikke trenger å tenke på f.eks. andregradsledd. 
+
+En interessant ting å se på ved bytte fra OLS til within effects er endringer i koeffisienter. Noen kan endre størrelse og fortegn. Hvorfor endres disse? Her er det gjerne slik at enkelte koeffisienter blir større og mer usikre p.g.a. at hovedkilden til variasjon i dataene er between-variasjon - hvis en variabel endrer seg lite innad i en enhet (politisk overbevisning, folketall), men mye på tvers av enheter, vil estimeringa bli annerledes.
+
+Motargumenter mot denne typen modeller
+
+- ineffektivt, fordi du legger til flere parametre i modellen når du øker N.
+- vi får ikke estimater som ser på forskjeller mellom enheter, kun estimater av effekter for et land når det endrer seg på en av sine variabler. Hvis det er det du er interessert i, må du gjøre noe annet.
+
+##Between effects
+En between-effects-modell er en modell av snittet for Y(t) mellom enheter, som ignorerer variasjon over t. Her utnytter du variasjonen i N, ikke T.
+
+```{r}
+ref_be = plm(ln_ref_flow~pop_diff+distance+regimedif+wardiff,
+             data=df,effect="individual",model="between")
+summary(ref_be)
+```
+
+Pooling i OLS gir estimater som vil likne på within effects eller between effects etter hvor variasjonen er.
+
+##Random effects
+Hvorfor heter det random effects? I en regresjonsmodell skiller man mellom de estimerte delene/fixed-delene, og random-delen, dvs. feilleddet, dvs- stokastiske forskjeller, ikke systematiske forskjeller.
+
+En random-effectsmodell har er feilledd med tre komponenter: feil for i, feil for t og støy for it.Antakelser for en slik modell er bl.a.:
+
+- snittet på de ulike delene av feilleddet er 0
+- det er ingen korrelasjoner mellom de ulike delene av feilleddet
+- ingen korrelasjoner innad i feilleddene - modellen passer like godt for i som j, på t som s, og for it som js.
+- og så en sentral antakelse: ingen korrelasjon mellom X og de ulike delene av feilleddet. 
+
+Dette lar seg estimere med generalized least squares og iterering. 
+
+Det en ender opp med er da en slaks vektet sak mellom within og between-effects-modellene. Vekten til within vs. between-variasjon bestemmes av størrelsen på variasjonen i feilleddet for enhetene (gitt at dette er med i feilleddet- antar at en her ser på et tilfelle uten tidsvariante effekter i feilleddet). Hvis variasjonen er 0, blir det standard OLS, hvis variasjonen er 1, blird et between...(sjekk dette!)
+
+Random effects anslår en ekstra variabel mer enn OLS, theta, som er variasjonen for feilleddet. Fixed effects anslår OLS + N parametre.
+
+Her er et eksempel, samme som over. Det er da altså hver enkelt enhet som får et random feilledd.
+
+```{r}
+ref_re_lmer=lmer(ln_ref_flow~pop_diff+distance+regimedif+
+              wardiff+(1|dirdyadID), data=df)
+summary(ref_re_lmer)
+```
+
+Merk at det er minst to pakker med funksjonalitet for å estimere en slik random effects-modell: lme4::lmer og plm::plm
+
+```{r}
+ref_re_plm = plm(ln_ref_flow~pop_diff+distance+regimedif+
+              wardiff, data=df, effect="individual",
+              model="random")
+summary(ref_re_plm)
+```
+Tror ikke Zorn sier noe annet enn at dette er litt smak og behag. Summary av funksjonene gir litt ulik output, listene er litt ulike, og kanskje svakt forskjellige koeffisient-estimater:
+
+```{r}
+temp = bind_rows("plm" = broom::tidy(ref_re_plm),"lmer"=broom::tidy(ref_re_lmer),.id="modell")%>%
+  select(.,modell,term,estimate)%>%
+  spread(.,modell,estimate)
+kable(temp,digits=2)
+```
+
+```{r}
+temp = bind_rows("ols"=broom::tidy(ref_ols),"we/fe"=broom::tidy(ref_fe),"be"=broom::tidy(ref_be),"re"=broom::tidy(ref_re_plm),.id="modell")
+
+#hvordan lage en nokenlunde pen tabell av dette? Estimatene er en ting, men standardfeilene og p-verdien bør vel også være med?
+
+tabell = select(temp,modell,term,estimate)%>%
+  spread(.,modell,estimate)
+kable(tabell,digits=2)
+```
+
+##Hvordan teste om en skal ha fixed eller random effects?
+En aktuell test er Hausmann-test. Hvis koeffisientene er veldig forskjellige, tolkes det som bevis på at random effects er dårlig egna. For å ta vårt eksempel fra over, en sammenlikning av FE og RE(plm):
+
+```{r}
+phtest(ref_fe, ref_re_plm)
+```
+
+Nullhypotesen er at random effects er best, alternativhypotesen at fixed effects er best. I vårt tilfelle tyder Hausman-testen på at fixed effects er best.
+
+Men du må ha mye data på N og T for at test-statistikken skal være kjikvadratfordelt. Testen kan feile. Og det er en generell spesifiseringstest mellom modeller, som sier at den ene er riktig, eller den andre skikkelig feil - noe som ikke er realistisk(?)
+
+Zorn argumenterer her for at en bør bruke substansielle argumenter for å bestemme hvilken modell en skal ha. 
+
+1. Hvis det er rimelig å anta at feilleddet for i er uavhengig av X, kan en velge Random effects. Hvis ikke, kan en velge fixed effects.
+2. Hvis du har paneldata, og skal slutte om N, og antar at effektene gjelder for hele populasjonen N - så antar du også at alle her er unike individer, noe som virker noe prakitsk. Er det heller rimelig å anta at effektene er tilfeldige, trukket fra et større univers? Antakeligvis, siden det er det du har gjort. Bruk Random effects.
+3. Hvis du har tidsserie med tverrsnittdata, f.eks. land, så skal du gjøre en slutning om de unike enhetene, eller utviklign over tid T. Effektene er gjerne ikke tilfeldig. Bruk fixed effects.
+4. Hva genererer forskjellene mellom individene på X og Y? Er det tilfeldig? Eller systematisk?
+5. Skal vi studere noe som er konstant over tid, kan vi ikke bruke fixed effects.
+
+Hvorfor ikke bare estimere Y(it) med både between og within-variasjon? (Virker som om svaret er ja, bare gjør det!)
+
+#GLS-ARMA og dynamikk
+Som vi har sett lenger opp, er noen av de klassiske antakelsene for OLS om strukturen på feilleddet, deriblant:
+
+- Homoskedasitiet over tid og rom (modellen passer like godt for alle enheter på et gitt tidspunkt, og for en gitt enhet over tid)
+- Ingen korrelasjon mellom feilledet over tid eller rom (autokorrelasjon, spatiell korrelasjon)
+
+(Fikser fixed og random-effects-modellene pkt. 1 for deg? Dvs. at dette kun er aktuelt hvis tiden gir deg problemer? Delvis - du kan modellere individ/enhetsfaste effekter enten eksplisitte eller som en del av varianskomponenten)
+
+I situasjoner med longitudinelle data er dette gjerne urealistisk. Og for å lette disse antakelsene kan en bruke generalised least squares, enten feasible GLS eller substantiv kunnskap om feilleddet.
+
+Parks utviklet (på 60-tallet eller noe) en rekke antakelser om feilleddet for paneldata han jobbet med, som er brukt mye i seinere tid. Disse utgjør også grunnlaget for PCSE - panelkorrigerte standardfeil.
+
+1. enheter er homoskedastiske over tid - like bra modell over tid for en enhet i
+2. det er noe kovariasjon mellom enhet i og j på tidspunkt t, men det er stabilt over tid.
+3. alle feil er korrelerte på tidspunkt t, men ikke over tid på tvers av enheter.
+4. enheter har autokorrelasjon over tid.
+
+Så kan dette brukes for fGLS. Men B og K har vist hvordan dette ikke lar estimere hvis en ikke har høy T, relativt til N - altså at en har mange obserasjoner over tid for hver enhet (?). Så mye data har en sjeldent. (Her er notatene om hvor store disse forskjellene bør være litt utydelige - ved behov, sjekk litteraturen)
+
+I stedet  brukes en estimeringsmetode som håndterer korrelasjonen innafor et tverrsnitt, ved å låne informasjon fra variasjon over tid. Ettersom OLS gir konsistente estimater av koeffisientene, men skjeive standardfeil, kan en beholde OLS-koeffisienter og erstatte standardfeilene med PCSE. Typisk vil en da få større standardfeil, og usikrere estimater. Dvs: gitt at det er rett, får en bedre følelse med usikkerheten av estimatene.
+
+Her antar en med PCSE ellers at paneldata-antakelsene er møtt.
+
+## Så hvordan velge estimeringsmetode i disse tilfellene?
+
+Antakelser:
+
+1. Passer modellen like bra for alle?
+2. Kan du anta at feil ikke er korrelerte
+3. Kan du anta at autokorrelasjon er 0?
+
+Hvis ja på alle: velg OLS.
+Hvis nei på alle: Parks tilnærming, eller PCSE. Behold OLS-koeffisienter.
+Hvis autokorrelason: Prais-Winsten.
+Hvis autokorrelasjon og forskjellig korrelasjon for forskjellige land: 
+Hvis autokorrelasjon, og modellen ikke passer like bra for alle enheter: Unike feil for hver enhet-
+
+Poenget er at en må bruke substantiv kunnskap for å si noe om hvordan feilen er strukturert. 
+
+Men PCSE er altså et verktøy for å håndtere et spesifikt problem med standardfeilene, det håndterer ikke heterogenitet på enhetsnivå (slik FE og RE gjør), og det håndterer ikke dynamikk over tid. 
+
+```{r}
+df <- read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/HF1998.csv", header=TRUE)
+summary(df)
+
+```
+Dette er eksempeldata fra Hall og Franzese (1998). Det er data på 18 OECD-land i 1955 til 1990, med N = 18, T = 36 og NT = 648. Den avhengige variabelen i studien er arbeidsledighet (ue), med uavhengige variabler GDP (GDP_PC), åpenhet (open), organisasjonsgrad (uden), venstrestyrt (lcab eller HasLCAB?), sentralbankens uavhengighet (cbi), koordinert lønnsdannelse (cwagebrg), interaksjon mellom sentralbank og lønnsdannelse (wagexcbi). Ligger også en variabel inf her. 
+
+
+```{r}
+
+temp = group_by(df,year)%>%
+  summarise(mean_unemployment = mean(ue,na.rm=TRUE),
+            min_unemployment = min(ue),
+            max_unemployment = max(ue)
+            )
+
+# Nifty range plot by year:
+par(mar=c(4,4,2,2))
+with(temp, plot(year, mean_unemployment, t="l",lwd=2,ylim=c(0,18),
+               xlab="Year",ylab="Unemployment Rate"))
+with(temp, points(year, mean_unemployment, pch=19))
+with(temp, segments(year,min_unemployment,year,max_unemployment,lwd=2))
+legend("topleft",bty="n",legend=c("Points Are OECD Means;",
+                                  "lines indicate min-max ranges"))
+
+#kopiert i ggplot...
+
+```
+
+Hvis vi aller først estimerer en standard oLS-modell (pooled OLS) for disse dataene, hva får vi da?
+
+```{r}
+modell_ols = plm(ue~GDP_PC+open+uden+lcab+cbi+cwagebrg+wagexcbi,
+                 data=df,
+                 model="pooling")
+
+summary(modell_ols)
+
+```
+
+Prais-Winsten
+```{r}
+model_prais <- prais_winsten(ue~GDP_PC+open+uden+lcab+cbi+cwagebrg+wagexcbi,
+                          data=df,max_iter=100)
+```
+
+Så kan vi estimere en GLS med homoskedastiske AR(1)-feil:
+
+```{r}
+model_gls <- gls(ue~GDP_PC+open+uden+lcab+cbi+cwagebrg+wagexcbi,
+                          data=df,correlation=corAR1(form=~1|country))
+summary(model_gls)
+```
+
+GLS med enhetsbasert heteroskedastisitet.
+
+```{r}
+model_gls2 <- gls(ue~GDP_PC+open+uden+lcab+cbi+cwagebrg+wagexcbi,
+              data=df,
+              correlation=corAR1(form=~1|country),
+              weights = varIdent(form = ~1|country))
+
+summary(model_gls2)
+```
+
+Og så eksempel med panelkorrigerte standardfeil:
+
+```{r}
+#her tester vi koeffsientene, med Beck og Katz sin robuste covarians-matriseestimator - også kjent som panel corrected standard errors
+coeftest(modell_ols,vcov=vcovBK)
+
+#kan også beregnes ved å ta en vanlig OLS fra lm() og regne ut PCSE med pcse()
+```
+
+```{r}
+rm(model_gls,model_gls2,model_prais,modell_ols)
+```
+
+
+#Dynamikk i modellen over tid
+(Dynamics - effekter som har med tid å gjøre?)
+
+Hvis du ser på paneldata eller tidsserie med tverrsnittdata som mange tidsserier, hva gjør du da? Moralen i visa her ser ut til å være at en ikke bør gjøre det, eller i hvert fall ikke forsøke dette samtidig som en løser ett eller flere av problemene over.
+
+En modell med et lagget ledd kalles for en autoregressiv modell. Hvis en i en slik modell har et perfekt feilledd, får du en skjeiv, men konsistent estimator - det vil si at problemet blir mindre når T vokser.
+
+Feilleddet vil imidlertid ikke være perfekt, fordi du (minst) har autokorrelasjon. Og da får du skjeive og inkonsistente estimater. 
+
+Du kan løse dette ved å også modellere et feilledd som er lagget (er ikke det den autoregressive modellen da?). Men når du gjør dette, vil den laggede Y gi en svær effekt, og alle de andre X vil bli bittesmå. 
+
+Keele og Kelly viser at så lenge det ikke er autokorrelerte feil, så er ikke dette nødvendigvis et statistisk problem. Det er ikke nødvendigvis et substansielt problem heller: Siden b påvirker Y over tid (gjennom effekten på Y, som kommer igjen i Y(t-1)), er den reelle effekten av b større enn koeffisient-estimatet alene tilsier. 
+
+##Kombinasjon av enhetseffekter og autoregresjon
+Å ikke modellerer feilleddet u(i), dvs. unike, uobserverte effekter for individer, selv om vi veit de er systematiske, vil være å inkludere dem i feilleddet. Det gir spesifikasjonsfeil. 
+
+Men det er heller ikke slik at å modellere feilleddet lar seg gjøre, fordi du får en feil på en annen parameter (autokorrelasjonsanslaget)....dette skjønte jeg ikke.
+
+Løsning 1: Ta første differanser av alt. Da ser en på endringer over tid, i stedet for nivå over tid. Her bruker du da differanser som et slags instrument - det er ikke autokorrelert? Det vil også i praksis være within effects, du ser på endringer over tid for en enhet. (Her er det også en som foreslår å bruke alle laggede variabler - hva? hvordan?)
+
+Løsning 2: Bias correction model. Hvor mye skjeivhet har vi? Dette fungerer for inntil ca. 20 T.
+
+##Stasjonære tidsserier i paneldataene dine?
+Generelt sett: ikke en god ide, vanskelig å finne en god test som sier om du har stasjonære data eller ikke.
+
+En tidsserie kan være gjennomsnittlig stasjonær, variabel stasjonær eller kovariant stasjonær. Serierer som er stasjonære lar seg enklere analysere, og ikke-stasjonære serier må antakeligvis transformeres med f.eks. differensiering. 
+
+En sentral antakelse er fortsatt at data har samme trend på tvers, samme variasjon over tid på tvers av enheter. Uten denne antakelsen kan man ikke bruke variasjon på tvers av enheter. En måte å teste dette på ser ut til å være "unit root tests":
+
+```{r}
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/AIDS-Africa-97-01.csv", header=TRUE)
+summary(df)
+```
+
+Datasettet erAIDs-tilfeller i Afrikanske land, 1997-2001. Som vi ser har dataene en god del variasjon innad i hvert år og over tid:
+
+```{r}
+temp = group_by(df,year)%>%
+  summarise(mean_HIV = mean(exp(lnAIDS),na.rm=TRUE),
+            min_HIV = min(exp(lnAIDS)),
+            max_HIV = max(exp(lnAIDS))
+            )
+
+with(temp, plot(year, mean_HIV, t="l",lwd=2,ylim=c(0,50),
+               xlab="Year",ylab="HIV Rate"))
+with(temp, points(year, mean_HIV, pch=19))
+with(temp, segments(year,min_HIV,year,max_HIV,lwd=2))
+legend("topleft",bty="n",legend=c("Points Are All-Country Means;",
+                                  "lines indicate min-max ranges"))
+
+```
+
+```{r}
+# Panel unit root tests:
+
+temp = select(df,ccode,year,lnAIDS)
+
+purtest(temp,exo="trend",test=c("levinlin"))
+purtest(temp,exo="trend",test=c("hadri"))
+purtest(temp,exo="trend",test=c("ips"))
+
+```
+
+Dette skjønte jeg ikke helt, men testene ser ut til å indikere litt forskjellige ting, noe som gjør det vanskelig å tolke - så hva gjør du? Oppsummerende: Hva sier teorien? Hva er du interessert i? Og hva er det mulig å svare på med data?
+
+#Hierachical / multilevel models - flernivåanalyse
+Forkortes HLM/MM 
+
+##Robuste varians-kovarians-estimater (sandwich-estimator)
+(NB! hva er koblinga mellom dette og flernivåanalysen? hva bruker en varians-kovarians til? Basert på White 1994 Estimation, Inference and Specification Analysis)
+
+Utgangspunktet er den standard antakelsen om homoskedastisitet - altså at modellen passer like bra for alle enheter. 
+Hvis det ikke er oppfylt, får vi en matrise omega som ikke kan fjernes. Denne matrisen kan være kjent eller ukjent - og typisk er den ukjent. Da veit vi heller ikke feilvariansen til hver enkelt observasjon.
+
+uu' = transponert variansematrise, ' brukes for transponert matrise.
+
+Whites insikt er at en kan bruke kvadratet av estimert standardfeil (residualen = forventa - observert) for å komme til en empirisk justert estimator, der observasjoner med store residualer vektes opp og observasjoner med små residualer vektes ned (i modellen?).
+
+Dette funker også i tilfeller hvor vi ikke kjenner omega - altså at analysen ikke veit noe om feilvariasjone for ulike observasjoner.
+
+Slide 4: et eksempel på hvordan en gjør dette i et sannsynlighetsrammeverk, MLE. Intuisjonen er lik: bruk empirisk informasjon for å justere sannsynlighetsestimatene. MLE dukker opp i modellene seinere.
+
+```{r}
+#vi generer noen data der vi kjenner y som en funksjon av 1 + støy
+id<-seq(1,100,1) # 100 observations
+x<-rnorm(100) # N(0,1) noise
+y<-1+1*x+rnorm(100)*abs(x)
+
+fit <- ols(y~x,x=TRUE,y=TRUE)
+fit
+
+
+```
+
+```{r}
+rvcv = robcov(fit)
+rvcv
+```
+
+##Hvis heteroskedastisitet skyldes gruppe-nivå-egenskaper?
+I Whites tilfelle kan vi vite ingenting. I det opprinnelige tilfellet kjenner vi hele Omega. Som oftest veit vi noe - som for eksempel at enhetene kan klustres i grupper. Gruppene er forskjellige, men enheter innafor ei gruppe har likere feilvariasjon. Da kan vi bruke robuste variansestimater.
+
+(Eksempelet på slide 6: feil estimat av standardfeil, robust covarians fikser standardfeil)
+
+I et slikt tilfelle estimeres feilvariasjonen innenfor hver gruppe først. Hvis gruppa er likere, så har en færre observasjoner enn man tror. Eksempelet på slide 8 viser dette: dette er samme data som før, bare ganger 16 - så ikke nye data. Men standardfeilene er 4 ganger så små. Asymptopia handler ikke om hvor mange observasjoner en legger til, men hvor mye informasjon en legger til.  
+
+
+```{r}
+bigID<-rep(id,16)
+bigX<-rep(x,16)
+bigY<-rep(y,16)
+bigdata<-as.data.frame(cbind(bigID,bigY,bigX))
+
+bigOLS<-ols(bigY~bigX,data=bigdata,x=TRUE,y=TRUE)
+bigOLS
+```
+
+Robcov på den gir samme standardfeil som det opprinnelige eksempelet.
+```{r}
+BigRVCV<-robcov(bigOLS,bigdata$bigID)
+BigRVCV
+```
+
+```{r}
+xsim=c(-3,-2,-1,0,1,2,3)
+hats100<-predict(fit,xsim,se.fit=TRUE)
+hats1600<-predict(bigOLS,xsim,se.fit=TRUE)
+hatsRVCV<-predict(BigRVCV,xsim,se.fit=TRUE)
+ub100<-hats100$linear.predictors + (1.96*hats100$se.fit)
+lb100<-hats100$linear.predictors - (1.96*hats100$se.fit)
+ub1600<-hats1600$linear.predictors + (1.96*hats1600$se.fit)
+lb1600<-hats1600$linear.predictors - (1.96*hats1600$se.fit)
+ubRVCV<-hatsRVCV$linear.predictors + (1.96*hatsRVCV$se.fit)
+lbRVCV<-hatsRVCV$linear.predictors - (1.96*hatsRVCV$se.fit)
+
+par(mar=c(4,4,2,2))
+plot(x,y,pch=16,xlab="X",ylab="Y")
+abline(lm(y~x),lwd=3)
+lines(xsim,ub100,lty=2,lwd=2)
+lines(xsim,lb100,lty=2,lwd=2)
+lines(xsim,ub1600,lty=2,lwd=2,col="red")
+lines(xsim,lb1600,lty=2,lwd=2,col="red")
+lines(xsim,ubRVCV,lty=3,lwd=2,col="green")
+lines(xsim,lbRVCV,lty=3,lwd=2,col="green")
+legend("topleft",legend=c("Black Dashed Line is N=100",
+                           "Red Dashed Line is Naive N=1600",
+                           "Green Dashed Line is Robust N=1600"),
+       bty="n")
+```
+
+Robcov  kan brukes på mange typer modeller, estimert på mange ulike måter - og er mye brukt. Hva er nedsida? slide 11.
+
+- i lineær regresjon gir robcov-estimater som bare er konsistente - altså kun uskjeive for høye datamengder. Eller lettere sagt - mer informasjon. For små datamengder blir t-testen feil.
+- hvis dataene dine faktisk er homoskedastiske, vil robcov være ineffektive. (men du bør ikke legge alt på effektivitet)
+- Freedman: Slutt å bekymre deg for varians-estimater, bekymre deg heller for spesifiseringsfeil og andre former for bias i koeffisient-estimatene. Særlig i tilfeller med mye data!
+
+(Freedman er interessant og flink - og slem - statistiker)
+
+```{r}
+rm(bigdata,bigOLS,BigRVCV,fit,hats100,hats1600,rvcv,hatsRVCV)
+```
+
+
+#Flernivåanalyse
+(Kompliment fra kjøkkenet-mengde om temaet. Er relevant fordi det er en god måte å tenke om regresjonsmodeller og -effekter på)
+
+Har du data med flere nivåer, der i har 1:N enheter, gruppert i gruppene j 1:J. Så J kan også tenkes som en variabel med variasjon i en dimensjon.
+
+Det klassiske eksempelet handler om elever i klasser på skoler. Altså det vi har i introduksjonsprogrammet.
+
+Både intercept og slope kan variere på tvers av grupper, dvs. at det er både individuelle og gruppe-slopes og intercept. Disse kan modelleres fixed eller random. Fixed og random viser her til hvorvidt en varierer på tvers av en eller anne gruppering av enhetene.
+
+Koeffisientene for slopes og intercept kan modelleres som liknininger, som har egne prediktor-variabler på gruppenivå. Plugget inn i likninga som helhet får vi likninga på slide 15. Dette er en full modell for hele greia - med interaksjonseffekter for alt. Og en X som følger sammen med feilleddet, noe du ikke vil ha.
+
+Følger vanlige antakelser. Antar uavhengighet mellom residualene mellom nivåene, i tillegg til observasjonene innenfor N og J.
+
+Modellering her er typisk opptatt av å få til en riktig spesifisert modell (med interaksjoner o.l.), enn standardfeil o.l.
+
+To måter for estimering: MLE, RMLE. MLE funker dårlig i tilfeller hvor en mangler informasjon om noen av kombinasjonene av dataene, noe som kan være et problem med små utvalg. MLE er også skjeive for små utvalg. Og det har en gjerne på andre nivå. Da bør en bruke RMLE, men det gir andre svakheter.
+
+Noen eksempler, med data på HIV-dødsrater 1990-2007.
+
+```{r}
+temp = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/HIVDeaths.csv", header=TRUE)
+df = filter(temp,is.na(HIVDeathRate)==FALSE)%>%
+  mutate(.,LnDeathPM = log(HIVDeathRate*1000)) #den avhengige variabelen må logges, den er skjeiv.
+
+summary(df)
+```
+
+Pooled, standard ols:
+
+```{r}
+model_ols = lm(LnDeathPM ~ GDPLagK + GDPGrowthLag + OPENLag + POLITYLag + POLITYSQLag + CivilWarDummy +               InterstateWarLag + BatDeaths1000Lag,
+               data=df)
+
+summary(model_ols)
+```
+
+Fixed effects / within-effects i paneldata-forstand
+```{r}
+model_fe = plm(LnDeathPM ~ GDPLagK+GDPGrowthLag+OPENLag+POLITYLag+POLITYSQLag+CivilWarDummy+             InterstateWarLag+BatDeaths1000Lag,
+           data=df,
+           effect="individual", 
+           model="within",
+           index=c("ISO3","year"))
+
+summary(model_fe)
+```
+
+Flernavå. Random effect på gruppe-intercept (gruppe=land), der hver intercept er tilfeldig, med estimert variasjon, uten prediktor på gruppenivå. Modellen sier om lag det samme som den andre modellen, så en trenger ikke å bekymre seg så mye for testing. 
+
+```{r}
+model_re = lmer(LnDeathPM~GDPLagK+GDPGrowthLag+OPENLag+POLITYLag+POLITYSQLag+CivilWarDummy+              InterstateWarLag+BatDeaths1000Lag+(1|ISO3),
+            data=df,
+            REML=FALSE)
+
+summary(model_re)
+```
+
+Men hva hvis det er forskjelige effekter av en økonomisk variabel på gruppenivå (gruppe=land) -dvs. random effects på slope. 
+```{r}
+model_hlm = lmer(LnDeathPM~GDPLagK+(GDPLagK|ISO3)+GDPGrowthLag+OPENLag+POLITYLag+POLITYSQLag+CivilWarDummy+                InterstateWarLag+BatDeaths1000Lag,
+              data=df,
+              REML=FALSE)
+
+summary(model_hlm)
+```
+
+Her skifter GDPLagK fortegn. 
+
+Fordi den har brukt MLE, kan en teste hvilken modell som er best med anova...(NB! Hvilken test er dette?)
+
+```{r}
+
+#tester hvor god modellen er med anova
+anova(model_re,model_hlm)
+
+```
+
+
+Random-estimatet kan tolkes som et estimat på en fordeling, der fixed effects-estimatet er snittet, og random effects er variasjonen. (illustreres under). Her ser vi at snittet i fordelinga av koeffisient-estimat er høyreskjev, mens mesteparten av data er negativ.
+
+```{r}
+temp = data.frame(coef(model_hlm)[1])
+
+head(temp)
+mean(temp$ISO3.GDPLagK)
+var(temp$ISO3.GDPLagK)
+
+with(temp, plot(density(ISO3.GDPLagK),lwd=3,
+              main="",xlab="Beta Values"))
+abline(v=mean(temp$ISO3.GDPLagK),lty=2)
+
+```
+
+HLM er veldig fleksible, kan bruke flere nivåer - og der noen kan være tid. Men hva vil tid her si? Hva vil det f.eks. si at en modellerer individer-> grupper -> tid? Er da tidseffekten betinget på effekten av gruppen?
+
+```{r}
+rm(model_fe,model_hlm,model_ols,model_re)
+```
+
+
+#Paneldata modeller for binære og tellevariabler
+Det er en sterk kobling mellom denne typen modeller, og f,eks. modeller for ordinale variabler - variabler med andre typer, ikke-normale, fordeling. Et mål med denne gjennomgangen er å lage en overgang til overlevelsesanalyse/hendelsesanalyse.
+
+Motivasjon: Hvis du har en latent, uobserverbar, variabel, som er en funksjon av noen variabler og støy. Du kan observere en variabel som enten er 1 eller 0, etter hvorvidt en har latent egenskap over en eller annen terskel.
+
+Da trenger du en funksjon som oversetter fra 0 og 1 til en annen sannsynlighetsfordeling (cdf). Men du ivaretar lineære egenskaper.
+
+Hva gjør du hvis du går fra tverrsnitt til longitudinelle data? Antakeligvis har du 
+
+- autokorrelasjon både i x og feilledd, 
+- du har konsistente koeffisient-estimater, men standardfeilene er skjeive og ineffektive, og kan være opptil 50 % for små. 
+
+Intuisjonen bak dette er tilsvarende som for grupperingseksempelet for lineære modeller over.
+
+One-way unit effects kan la seg estimere for logistisk regresjon, ikke probit. Hva er egenskapene her?
+
+Siden det er en fixed effects-modell med dummy variabler, legger vi til en dummy-variabel for hver ny N. Dette gikk greit for lineære modeller, men for en ikke-lineær modell smitter inkonsistens over fra feilledd-estimater over til koeffisient-estimatene.
+
+Chamberlain fant en måte å unngå å estimere alfa (intercept i fixed effects) på, ut ifra andelen enere i data: en trenger ikke å estimere en egen intercept for hver enhet, det er et begrenset antall verdier den unike intercepten kan ha. Modeller som bygger på dette leder oss også inn i et problem hvor noen enheter kan ha null within-variasjon på Y - bare 1 eller 0. Disse kan ikke brukes av modellen. Men det fjerner inkonsistens-fella.
+
+"Dirty pool"-artikkelen - Green m.fl. 2001 og Beck og Katz 2001 for gode eksempler på dette. Green argumenterer for at en må ha fixed effects - Beck og Katz sier nja, det bir problemer for å si noe om variabler som endrer seg sakte, eller som kan være bare 1 eller 0 (demokrati, går til krig).
+
+Siden det er en fixed effects-modell, kan ikke variabelr som ikke varierer innad i en enhet estimeres.
+
+Siden estimatene er koeffisienter på en ikke-lineær kurve, er effekten avhengig av hvor man er på kurven. For logistisk regresjon må man holde andre egenskaper konstant. Og for logit med paneldata må man inkludere intercept-leddet konstant.
+
+Eksempelet er fra Segal (1986), og er en studie av rettslige avgjørelser om hvorvidt ransaking av personer var tillat (vote), avhengig av en rekke egenskaper ved saken og dommeren. Høy T gir estimerbarhet - fordi det er dommere som er N og stemmegivning som er T. Hadde data vært organisert slik at saker er N og stemmegivning T, kunne en mista saker som var enstemmig.
+
+```{r}
+#load data
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/SegalVotes.csv",header=TRUE)
+
+summary(df)
+
+```
+
+```{r}
+# Fixed Effects model:
+model_fe = glmmboot(vote~warrant+house+person+business+car+us+except,
+                  data=df,
+                  family="binomial",
+                  cluster=justid)
+summary(model_fe)
+
+```
+
+
+##Random effects
+Random effects? Da setter vi alfa-leddet inn i feilleddet. Dette impliserer noe om variasjonen i feilleddet...?
+
+Hvis variasjonen i ett av feilleddets to komponenter er 0, er det bare hvit støy som går inn i det andre komponenten (?). Hvis den ikke er det, så er det samvariasjon mellom feilene.Hvordan tenke om sannsynlighet her? Både logit og probit krever at du integrerer en gang per T. Det blir mateamaisk krevende
+
+Ved å finne betingede sannsynligheter på alfa - feilleddet for enhetene - kan vi gjøre dette uten at det blir så krevende. 
+
+(Noe om at antakelsen om feilvariasjon ligger bak valg av logit eller probit?)
+
+(HM?)
+
+Hva estimerer du her?
+- rho-estimat:andel av variasjon som skyldes variasjon i alfa-ledd. Mer brukt estimeringsmetode er Markov Chain Monte Carlo MCMC. Bayesiansk, posterior-antakelse.
+
+En antar fortsatt av det ikke er noen covariasjon mellom alfa og X. Altså samme som for lineær random effects.
+
+Eksempel! Vanlig logistisk regresjon på slide 14, fixed effects på 15. 
+
+ Random effects på s16.
+
+```{r}
+model_re = glmmML(vote~warrant+house+person+business+car+us+except+justideo,
+                  data=df,
+                  family="binomial",
+                  cluster=justid)
+
+summary(model_re)
+```
+```{r}
+rm(model_fe,model_re)
+```
+
+#Modeller for event counts - hendelses,tellinger.
+
+Hvilke data snakker vi om? Ikke ordinale skalaer, og ikke grupperte binære data. Men diskrete heltall, ikke-negative, og kumulative - du får 3 etter 2 etter 1. 
+
+Poisson-antakelse:
+- Hendelsene er uavhengige, og ikke-simultane.
+- Motivasjonen: i en Bernoulli-trial der antallet forsøk går mot uendelighet, men sannsynligheten for en suksess går mot 0 (->bittelitten). (eksempel: dødsfall i den prøyssiske hæren etter hestefall). Da er utfallet poisson-fordelt. 
+
+MOdellen må være strengt positiv.
+
+Eksempeldataene her er fra State Failure Task Force
+
+```{r}
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/SFTF.csv")
+summary(df)
+pdim(df)
+```
+
+##Fixed effects
+Så hva om det er unit-effects her? F.eks. intercepts? Ikke noe "incidental parameter"-problem, som du får i logit eller probit-tilfellet - det er begrensa verdier som alfa/intercepts kan ta.
+
+Siden poisson-fordelinga er vennlig innstilt, får en sjelden estimeringsproblemer. Her brukes en brute force tilnærming - inkluderer alle land som dummy.
+
+```{r}
+poisson_fe = glm(ciob~POLITY+unuurbpc+poldurab+I(year-1900)+as.factor(countryid),
+                 data=df,
+                 family="poisson")
+
+#summary(poisson_fe)
+```
+
+##Random effects
+Som med andre modeler må vi se på joint distribution av ...hvafornoe? En samvariasjon med alfa, dvs. individuelt feilledd. Den enkleste antakelsen er at individuell feilledd er gamma-fordelt (>0). I likhet med en anna modell (logit/probit?) gjør denne antakelsen at varisjonen i feilleddet øker.
+
+Random effects poisson model koeffisienter tolkes som vanlige poisson koeffisienter (som tolkes hvordan?).
+
+Estimeres i R med lme4::glmer eller glmmML::glmmML , kan gi noe ulike estimater. 
+
+```{r}
+# Random effects Poisson
+
+# library(lme4)
+posson_re = glmer(ciob~POLITY+unuurbpc+poldurab+I(year-1900)+(1|countryid),
+                  data=df,
+                  family="poisson")
+
+summary(posson_re)
+
+```
+
+glmmML legger også inn tester for hvorvidt en skal ha random effects eller ikke (H0: ingen random effects).
+
+```{r}
+
+# Alternative RE Poisson, using glmmML:
+poisson_re_alt = glmmML(ciob~POLITY+unuurbpc+poldurab+I(year-1900),
+                          data=df,
+                          cluster=countryid,
+                          family="poisson")
+
+summary(poisson_re_alt)
+
+```
+
+scale parameter er variasjon for random effects.
+
+```{r}
+rm(poisson_fe,posson_re,poisson_re_alt)
+```
+
+
+#Generalized Estimating Equations
+
+##Generalized Linear Models (GLM)
+Først en liten intro til GLM: formålet med dette er å generalisere en lineær modell til en verden av ikke-lineære, begrensede verdier - som Poisson, logistisk, probit, osv. Her transformeres modellen fra XiB til g(), via en link-funksjon, og en antakelse om fordelinga av Y (over beta/X). Fordelinga må være den eksponentielle familien. Generelt sett: de fleste modeller du vil være interessert i, kan settes inn i et GLM-rammeverk.
+
+Estimeres via en score-likning (også kalt Fisher-scoring), med tre komponenter: første deriverte av Y, varianse-matrise og residual-leddet. Målet er å finne Beta-verdier, slik at residualene er så små som mulig(?). Også kjent som en kvasi-likelihood (ikke-helt-sannsynlighet på norsk?) (slide 3). Beta-verdier følger av observerte data, link-funksjonen en har valgt, og fordelinga en har antatt for dataene (den faktiske dataene).
+
+Så hvordan generalisere GLM til longitudinelle data? (Eller andre grupperte data)
+
+##GEE
+Sentralt problem: hvordan håndtere multivariat avhengighet mellom Y? Gitt uavhengighet mellom enhetene, så vil en ha korrelasjon over tid - i T dimensjoner. Og dette er residual-avhengighet i feilleddet, etter at effektne av X er tatt ut.
+
+En kan komme rundt dette ved å lage en korrelasjonsmatrise (ikke full felles distribusjon) - også kalt "working correlation matrix". Den spesifiseres av den som gjør analysen. Dette er within-unit variation.
+
+(En del utledning av modellen på slide 5-7)
+
+Noen vanlige antakelser om matrisa:
+
+- uavhengig. i grunn en pooling av observasjoner, og en GLM på alle observasjonene som ignorerer tidsvariasjon.
+- konstant korrelasjon mellom to tidspunkter (eller gruppe - f.eks. skole). Dette likner på en random effects-modell, der hver gruppering/enhet har en felles feilkomponent. Den felles feilkomponenten gir en felles korrelasjon i feilleddet for denne grupperinga/enheten - og korrelasjonen vil være konstant.
+- autoregresjon. Jo nærmere to tidspunkt t og s er hverandre, jo høyere korrelasjon. Dette kan være en rimelig antakelse i mange longitudinelle tilfeller.
+- stasjonær. Det er korrelert mellom tidspunkt t og s, inntil et visst punkt, hvor den forsvinner.
+- ustrukturert. Fullt frislipp, alle tidspunkt t og s kan korrelere på ulikt vis. Estimer korrelasjonsmatrisa fra data. (Høres veldig greit ut - hvorfor ikke alltid bruke denne?) 
+
+Dette er korrelasjonsmatrisa for tid for alle enheter.
+
+Hvordan velge riktig matrise? Bruk substantiv kunnskap. Men husk at det er gjenværende korrelasjon etter X-variabler. Hvis T er liten og N stor, kan du bruke ustrukturert. Så du kan prøve ulike, og sammenlikne. Generelt bør det ikke bety så mye - for du får fortsatt korrekte koeffisienter og konsistente standardfeil, og det påvirker dermed ikke de substantive tolkninga. I teori. 
+
+Dette endrer score-likningen fra GLM, med et annet ledd for varianse-matrisa. Likninga kan da estimeres i to steg.
+
+(Spørsmål: siden dette estimeres, kan en finne ulike løsninger ut ifra hvilke startverdier de numeriske metodene bruker? For enkelte problemer og enkelte problemer, ja. Normal, poisson m.fl. er vennlige fordelinger - men logistisk regresjon kan være mer problematisk ved f.eks. tomme celler. Men det er i større grad en funksjon av data - har du ikke data nok til å kjøre en modell, vil den kunne eksplodere. Så set.seed() for reproduserbarhet)
+
+(Hvilke antakelser om residualen gjør du i en GEE, alfa? Må de være uavhengige fra X'ene? Vi trenger ikke å bekymre oss for felles sannsynlighetsfordeling av alle alfa, du bryr deg om korrelasjonen mellom feilene for alfaene? Antakelse om fordeling av feilene - enten alfa eller den rene støy-delen - er vanligvis ikke så nøye. Men det du gjør RE og FE er å betinge på alfa - enten den er fixed eller random. GEE bryr seg ikke om enhetseffekter, de modellerer korrelasjon mellom feilene. Det overordna spørsmålet er hvilken modell en bør velge - hvis det er enhetseffekter, må en bruke RE og FE, hvis det ikke er enhetseffekter passer GEE).
+
+Hvilke fordeler har GEE:
+- Når N går mot uendelig, er beta-estimatene konsistente og normalfordelte med varians (standardfeil?) sigma. 
+- variansen kan enten estimeres på en standard-måte. Da er standardfeilen konsistent hvis korrelasjonsmatrisa er riktig spesifisert. Hvis korrelasjonsmatrisa er feil, er den ikke konsisten. 
+- eller en robust måte (empirisk korrigerte standardfeil). Da er standardfeilen konsistent, SELV hvis korrelasjonsmatrisa er feil spesifisert (magisk! eller ikke - data fikser det for deg?). Er litt mindre effektiv enn standard-måten. I motsetning til robuste standardfeil fra i går, inkluderer vi kunnskap om dataene her De klassiske robuste feilene er for tilfeller hvor vi ikke veit.
+
+Hva veit vi om modeller hvor vi får feil i feilene? Det påvirker ikke koeffisientene - men det påvirker standardfeilene, og dermed også slutninger. 
+
+En rekke fordeler. Zorn er særlig fornøyde med at du får spesifisere korrelasjonsmatrisa med eksisterende kunnskap, men at du ikke må ha rett for at resultatet skal bli rett. Noe som er fint, siden du sjelden veit om du har rett eller ikke.
+
+##Hvordan tolke en GEE?
+Generelt sett som en GLM. Den viktigste forskjellen er at det er en marginal modell eller populasjonsgjennomsnittsmodell, ikke en kondisjonell modell eller enhets-modell. 
+
+Du inkluderer ikke enhetseffekter (hverken FE eller RE). Du håndterer det i variasjonsmodellering, men du inkluderer det ikke. Dvs. du inkluderer ikke effekten av en enhets unikhet i modellen, hverken i selve modellen eller i feilleddet, du spesifiserer hvordan unikheten varierer.
+
+Det vil si at ved tolkning, må en GEE si "i gjennomsnitt for populasjonen er effekten av B1 på Y sånn". I FE må en si "gitt verdien av A1, er effektne av X på Y sånn". Du kan ikke sammenlikne koeffisiene direkte - koeffisienter fra GEE vil være mindre. Hvis en ikke har (store) enhetseffekter, vil koeffisientene være likere. 
+
+Men hva hvis du tenker at det er viktige enhetseffekter? De modelleres ikke i GEE, og modellen vil kunne være feilspesifisert. Du kan prøve å brute-force legge inn enhets-dummyer, men det er ikke nødvendigvis en god løsning. Smarte folk tror ikke at dette er så lurt. Enhetsvariablene eliminerer (teoretisk) korrelasjonsmatrisa.
+
+##Du kan ha en substantiv interesse i korrelasjonsmatrise?
+(slide 17-19)
+
+Den substantive interessen er korrelasjonen (nei, den felles sannsynlighetsfordelinga) innad i en enhet. F.eks. hva som bestemmer konsistent eller ikke-konsistens i svar i en survey for en enhet. Eller hvordan høyesterett-dommere stemmer sammen, fratrukket effekten av vanlige variabler (Ginsburg - Scalia).
+
+GEE2 modellerer denne korrelasjonsmatrisa. Ved å inkludere korrelasjonsmatrisa i modellen, så må den spesifiseres riktig for å gi konsistente estimater av beta-koeffisienter.
+
+##EKsempel!
+Støtte til president Bush-data
+```{r}
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/BushApproval.csv") 
+summary(df)
+pdim(df)
+```
+
+geepack::geeglm har robuste standardfeil som standard. Ulike pakker, ulike standard.
+
+Dette er en lineær LS-modell på paneldata med uavhengig korrelasjonsstruktur. "Estimated scale parameter" er sigmasquaredhat - estimert variasjon'
+
+```{r}
+gee_ind = geeglm(approval~partyid+perfin+nateco+age+educ+class+nonwhite+female,
+                 data=df,
+                 id=idno,
+                 family=gaussian,
+                corstr="independence")
+
+summary(gee_ind)
+```
+
+bør være ganske lik en OLS på samme, eller GLM.
+
+```{r}
+model_glm = glm(approval~partyid+perfin+nateco+age+educ+class+nonwhite+female,data=df,family=gaussian)
+
+# Coefficients:
+cbind(gee_ind$coefficients,model_glm$coefficients)
+
+# Standard Errors:
+cbind(sqrt(diag(gee_ind$geese$vbeta.naiv)),sqrt(diag(vcov(model_glm))))
+```
+
+Exchangable - Lik korrelasjon. Den estimeres av modellen, og er på 0.232 (mellom observasjoner på t og s for enhet i - nei, alle enheter!).
+
+```{r}
+gee_exc = geeglm(approval~partyid+perfin+nateco+age+educ+class+nonwhite+female,
+                 data=df,
+                 id=idno,
+                 family=gaussian,
+                corstr="exchangeable")
+
+summary(gee_exc)
+```
+
+AR1-korrelasjonsstruktur. Alpha er 0.29 - og kvadreres så med større eksponent etter hvert for s blir større i t+s.
+```{r}
+gee_ar1 = geeglm(approval~partyid+perfin+nateco+age+educ+class+nonwhite+female,
+                 data=df,
+                 id=idno,
+                 family=gaussian,
+                 corstr="ar1")
+
+summary(gee_ar1)
+```
+
+Ustrukturert. Viser korrelasjonsmatrise for alle enheter, for de ulike tidspunktene. Når korrelasjonen i residualen går ned, er de modellerte elementene bedre. Eksempel-historien: Bush Sr. sin oppslutning i starten skyldtes felles fiende i Irak. Men så gikk økonomien dårlig, og standard-modellen slår inn.
+
+```{r}
+gee_unstr = geeglm(approval~partyid+perfin+nateco+age+educ+class+nonwhite+female,
+                   data=df,
+                   id=idno,
+                   family=gaussian,
+                   corstr="unstructured")
+summary(gee_unstr)
+```
+
+Bruker scatterplot-matrise for å vise at beta-koeffisienten er ganske like. Som forventa. 
+
+```{r}
+betas = cbind(gee_ind$coefficients,gee_exc$coefficients,gee_ar1$coefficients,gee_unstr$coefficients)
+
+scatterplotMatrix(betas[-1,],smooth=FALSE,
+                  var.labels=c("Ind","Exch","AR1","Unstr"),
+                  diagonal=FALSE)
+```
+
+Men også standardfeilene er ganske like. 
+
+```{r}
+# SEs:
+ses = cbind(sqrt(diag(gee_ind$geese$vbeta)),
+             sqrt(diag(gee_exc$geese$vbeta)),
+             sqrt(diag(gee_ar1$geese$vbeta)),
+             sqrt(diag(gee_unstr$geese$vbeta)))
+
+scatterplotMatrix(ses[-1,],smooth=FALSE,
+                  var.labels=c("Ind","Exch","AR1","Unstr"),
+                  diagonal=FALSE)
+```
+
+Så da er også de substantive tolkningene like.

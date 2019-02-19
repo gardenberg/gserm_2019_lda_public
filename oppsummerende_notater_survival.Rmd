@@ -1,0 +1,1019 @@
+---
+title: "Oppsummerende notater - overlevelsesanalyse/hendelsesanalyse"
+output: github_document
+---
+
+#hva kjennetegner denne analyseformen?
+
+Dataene er
+
+- diskrete hendelser (ikke kontinuerlig)
+- finner sted over tid
+- kan være telle-data,
+- kan censoreres - noen observasjoner får ikke hendelsen.
+-- høyre-sensurerte observasjoner: observasjoner hvor hendelsen ikke har skjedd når observasajonen slutter
+-- Venstre-sensurerte observasjoner: observasjoner hvor vi ikke har data på starten av forløpet, og som enda ikke har opplevd hendelsen
+-- annen sensurering: andre grunner til at de blir kasta ut av datagrunnaget (ble monk, skulle ikke gifte seg)
+
+Hvis du modellerer dette som regresjon, så finner du en density for tid til hendelse eller censoring. Men det er to svakheter: 1) for å få en høy verdi, må du ha risiko for hendelsen hele veien 2) sensorering - ikke alle har opplevd hendelsen. En bør ikke blande disse to ufallene. Og en kan heller ikke kaste dem ut - for da velger du på den avhengige variabelen. 
+
+Du kan både ha data med tidsinvariante og tidsvariante variabler. (Zorn sier han har noe kode for omstrukturering!)
+
+Litt forvirrende notasjon: censoring indicator bruker gjerne slik at 1 betyr at hendelsen skjedde. Altså en event indicator.
+
+```{r}
+library(survival)
+library(tidyverse)
+library(flexsurv)
+library(smcure)
+library(colorspace)
+library(coxme)
+library(RColorBrewer)
+
+#innstillinger
+set.seed(1106)
+options(scipen = 99) #aldri vitenskapelig notasjon
+options(digits = 2) #generelt sett færre desimaler
+```
+
+
+##Funksjoner
+probability density f(t) er sannsynlighet på alle punkt t.
+
+Kumulativ distribusjonfunksjon F(t) svarer på hvor stor sannsynligheten er for å være gift på tidspunkt t>T. Det er integrallet av f(t).
+
+Survivor function S(t): sannsynlighet for å ikke ha opplevd hendelsen opp til og inkludert tidspunkt t. 1-F(t). Negativ av deriverte av S(t) er lik f(t).
+
+Hazard-function h(t): f(t) / S(t) - sannsynlighet for å oppleve hendelsen på et spesifikt tidspunkt t, gitt at du ikke har opplevd hendelsen enda. Hasarden gir ikke egentlig en sannsynlighet eller betinget sannsynlighet: du kan få hasarder større enn 1. Det er riktigere å kalle det en risiko.
+
+(eksempel-bilde av disse på slide 8)
+
+Kumulativ hasardfunksjon: H(t). INtegrallet av h(t).
+
+P.g.a. av matematikken er det mange nyttige sammenhenger her.
+
+##Antakelser
+- Sensurering antas å være (betinget) uavhengig av tid til hendelse/sensurering, eller kovariater. 
+
+Dette er betinget på X. Hvis modellen er god, er ikke antakelsen problematisk - dvs. at du inkluderer de viktigste variablene for hendelsen og evt. sensurerings-hendelser. 
+
+#Overlevelsesdata - grunnleggende analyse
+--
+Kaplan-Meier og Nelson-Aalen-estimatorer for S(t). Kan være minimalt forskjellig, men asymptotisk like - dvs. like når mengden data stiger. Tillater utledning av andre variabler.
+
+Eksempeldataene er OECD Cabinet Survival data, med 314 regjeringer i 15 land.
+
+```{r}
+#eksempler
+
+#data fra en studie av regjeringsoverlevelse i OECD-land  
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/KABL.csv",header=TRUE)
+
+#S(t)-estimater
+KABL_fit = survfit(Surv(durat,ciep12)~1,data=df)
+
+#plotter S(t)
+plot(KABL_fit)
+
+#alternativt med ggplot
+temp = broom::tidy(KABL_fit)
+ggplot(data=temp)+
+  geom_line(aes(x=time,y=estimate))+
+  geom_ribbon(aes(x=time,ymin=conf.low,ymax=conf.high),alpha=0.1)
+```
+
+Da kan vi også finne H(t) - kumulativ hasard:
+'
+```{r}
+KABL_fH = survfit(Surv(durat,ciep12)~1,type="fleming",data=df)
+temp = broom::tidy(KABL_fH)
+temp$fH = -log(temp$estimate)
+temp$fH_upper = -log(temp$conf.high)
+temp$fH_lower = -log(temp$conf.low)
+
+ggplot(data=temp,aes(x=time))+
+  geom_line(aes(y=fH))+
+  geom_ribbon(aes(ymin=fH_lower,ymax=fH_upper),alpha=0.1)+
+  geom_point(aes(y=fH),data=filter(temp,n.censor>0))
+```
+
+For å sammenlikne om to kurver er statistisk ulike, kan vi bruke log-rank-test for å teste ulikheter. Dette likner litt på en kjikvadrat-test.
+
+```{r}
+#eksempel på logrank-test.
+
+survdiff(Surv(durat,ciep12)~invest,data=df,rho=0)
+
+```
+
+Eller sammenlikne plot av Kaplan-Meier-kurver, med konfidensintervaller:
+
+```{r}
+#modell
+KABL_fit = survfit(Surv(durat,ciep12)~invest,data=df)
+
+#plotter
+temp = broom::tidy(KABL_fit)
+ggplot(data=temp,aes(x=time))+
+  geom_line(aes(y=estimate,colour=strata))+
+  geom_ribbon(aes(ymin=conf.low,ymax=conf.high,colour=strata),alpha=0.1)
+
+```
+
+Så en omtur om counting process formulatio for survival anaysis -> Martingales: Gitt observasjoner på X på mange tidspunkt 1-T, er det beste gjettinga på X(t+s), X(t) - altså en hukommelsesløs prosess, beste gjetning er det som skjedde sist. Nyttig for andre formuleringer og anvendelser av data. Hvis en serie er en Martingale, sier det noe om hvordan du skal tenke rundt den.
+
+#Parametric survival models
+(hvordan ser egentlig prosedyren for fitting ut?)
+
+T: overlevelse til tidspunkt T (sånn ca.)
+
+Intuisjonen bak formel på slide 3: Hva kan vi lære av observerte hendelser? Noe om overlevelse, noe om sannsynlighet for å oppleve hendelsen på punkt t. Hva kan vi lære av sensurerte hendelser? Bare at de var med til et visst punkt - altså noe om overlevelse. 
+
+Gitt vanlige antakelser om sannsynligheter (hva nå enn det er - betinget uavhengighet?), kan en utlede en formel her. En trenger en fordeling for å komme lenger - hvilken fordeling kan passe for hasarden?
+
+##Eksponentiell modell 
+Den enkleste matematiske fordelinga - en konstant over tid, som fører til utledning av eksponential modell for S(t). Illustrert på slide 5. Dvs. at vi gjør en antakelse om at hasarden er flat over tid.
+
+Hvorfor har en flat hasard en avtakende overlevelsesfunksjon og en avtakende sannsynlighetsfordeling? Fordi individer med høy hasard faller ut tidlig (....?). 
+
+Funksjonen på slide 6 for S(t) er en log-log-funksjon, og er en del av en kobling til event count models. Ligner på en poisson-funksjon for sannsynligheten for å få en 0: Eksponential log-likelihood.
+
+Mange av R-funksjonene for dette benytter en litt anna formulering: Accelerated Failure Time, AFT. På slide 8 utledes denne moldellen fra en klassisk regressjon av tid T, strengt positiv. Med antakelsen at feilleddet er eksponentielt fordelt, har en samme modell som over. Intuisjonen bak AFT-navnet er at X øker eller minsker tiden til hendelse - selv om hasarden er lik. Men fortegnet på koeffisientene er omvendt i denne formuleringa som i den over. Ting som øker hasarden, senker tiden til hendelse.
+
+```{r}
+#eksempel med KABL-data som over
+df <- read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/KABL.csv")
+
+# Survival object (again):
+objekt_surv = Surv(df$durat,df$ciep12)
+
+# En måte å sette opp en modell på
+xvars<-c("fract","polar","format","invest","numst2","eltime2","caretk2")
+modell = as.formula(paste("objekt_surv ~ ", paste(xvars,collapse="+")))
+
+
+model_exp_aft = survreg(modell,data=df,dist="exponential")
+summary(model_exp_aft)
+```
+
+"Scale fixed at 1" betyr at det er en eksponential modell.
+
+Parametriske overlevelsesmodeller er litt vanskelige å kjøre i R. De fitter modellen i AFT-form. Så tolkninga av invest-koeffisienten -0.3 (exp=0.8) er at invest=1 gir kortere tid til hendelse - ikke at invest=1 har lavere hasard enn invest=0. (Hasarder kan økes uendelig, men overlevelsestider kan ikke senkes uendelig)
+
+Hvordan tolke hasardrater (hvor kommer hasard-rater inn? i en modellformulering av eksponential-modellen og andre steder): hasardrate for A (med X1=1) / hasardrate for B (med X1=0), alt annet likt. P.g.a. algebra, kan du ta exp(koeffisient-estimat), og finne hasardraten. Dette er likt som oddsratioer. 
+
+```{r}
+koeff_exp_ph = (-model_exp_aft$coefficients)
+koeff_exp_ph
+koeff_exp_hr = exp(-model_exp_aft$coefficients)
+koeff_exp_hr
+```
+
+I eksempeldataene ser vi da, at 
+
+- gjennomsnittlig effekt av "investiture" på regjeringens overlevelse er 100*(1.45 - 1) = 45 % økning i hasard for sammenbrudd.
+- gjennomsnittlig synker investiture predikert overlevelsestid med 100*(1-exp(-0.369)) = 30 %. (ikke helt sikker på hvor tallet kommer fra - AFT?)
+
+Hvis du vil ha dette mer generelt, kan du 
+- for flere enheters endring: ha exp(antall enheter endring * betakoeffisient),
+- for endring av flere enheter samtidg: exp(vektor av variabler og variabelkoeffisienter som endres multiplisert med hverandre)
+
+Eksempel på å plotte predikert overlevelsestid på slide 17. Kanskje lettere enn slik jeg gjorde det i intro-oppdraget?
+
+```{r}
+model_exp = flexsurvreg(modell,data=df,dist="exp") #dette er proportional hazards, ikke AFT.
+
+FakeInvest<-t(c(mean(df$fract),mean(df$polar),mean(df$format),1,
+                mean(df$numst2),mean(df$eltime2),mean(df$caretk2)))
+FakeNoInvest<-t(c(mean(df$fract),mean(df$polar),mean(df$format),0,
+                  mean(df$numst2),mean(df$eltime2),mean(df$caretk2)))
+colnames(FakeInvest)<-xvars
+colnames(FakeNoInvest)<-xvars
+
+plot(model_exp,FakeInvest,mark.time=FALSE,col.obs="black",
+     lty.obs=c(0,0,0),xlab="Time (in months)",ylab="Survival Probability")
+lines(model_exp,FakeNoInvest,mark.time=FALSE,col.obs="black",
+      lty.obs=c(0,0,0),col=c(rep("green",times=3)))
+legend("topright",inset=0.05,bty="n",
+       c("Investiture Requirement","No Investiture Requirement"),
+       lty=c(1,1),lwd=c(2,2),col=c("red","green"))
+
+```
+
+##Weibull-modell
+Så hvis antakelsen om at konstant hasardrate ikke er realisitsk (f.eks. fordi du studerer noe med liv - folk, garantier, mekaniske deler som forfaller): antakelse om konstant økende eller fallende hasardrate. p er et skalerings- eller formparameter.
+
+Det er en modell hvor hasarden endes monotont over tid, og endringsraten estimeres fra data.
+
+h(t)
+- For p=1, er weibull-modellen den eksponentielle modellen. 
+- Hvis p>1, øker h(t) med t
+- Hvis 0<p<1, synker h(t) med t
+
+(illustrasjon på slide 21)
+
+```{r}
+#simulerer noen data
+t<-cbind(1:60,1:60,1:60)
+P<-c(0.5,1,2)
+WeibullHs<-t(apply(t,1,function(t) 0.02*P*((0.02*t)^(P-1))))
+WeibullSs<-t(apply(t,1,function(t) (exp(-0.02*t))^P))
+
+#hasard-kurver for disse dataene
+plot(t[,1],WeibullHs[,1],t="l",lwd=3,lty=1,col="green",
+     xlab="Time",ylab="Hazard",ylim=c(0,0.08))
+lines(t[,2],WeibullHs[,2],t="l",lwd=3,lty=2,col="black")
+lines(t[,3],WeibullHs[,3],t="l",lwd=3,lty=3,col="red")
+legend("topright",inset=.02,
+       c("p = 0.5","p = 1.0","p = 2.0"),
+       lty=c(1,2,3),lwd=c(3,3,3),col=c("green","black","red"),
+       cex=1.2,bty="n")
+
+```
+
+
+for S(t) impliserer det at S(t) faller kjappere for høyere p. (illustrasjon side 22).
+
+```{r}
+plot(t[,1],WeibullSs[,1],t="l",lwd=3,lty=1,col="green",
+     xlab="Time",ylab="Survival Probability",ylim=c(0,1))
+lines(t[,2],WeibullSs[,2],t="l",lwd=3,lty=2,col="black")
+lines(t[,3],WeibullSs[,3],t="l",lwd=3,lty=3,col="red")
+legend("bottomleft",inset=.02,
+       c("p = 0.5","p = 1.0","p = 2.0"),
+       lty=c(1,2,3),lwd=c(3,3,3),col=c("green","black","red"),
+       cex=1.2,bty="n")
+```
+
+Lambda endres i modellen med kovariater, endrer nivået på hasarden før p (?). p er invers relatert til vairasjonen i feilleddet.
+
+scale-parameteren i eksempelt på 25 er sigma, dvs. at p = 1/.77. 
+
+Når du eksponenerer koeffisientene, forblir s.e. og slutninger de like.
+
+Et eksempel med KABL-dataene. Første forskningsfunn var at kabinett-kollaps er en poisson-prosess, en nesten hukommelseløs prosess, hvor hasarden er flat over tid. Litt i motsetening til minoritets-koalisjons-litteratur-funn, hvor koallisjoner i regjeringer fører til flertaller faller sammen p.g.a. kompromisser som gjør folk misfornøgd: hasarden stiger.
+
+```{r}
+model_wbull_aft = survreg(modell,data=df,dist="weibull")
+model_wbull_aft
+
+koeff_wbull_ph = (-model_wbull_aft$coefficients)/(model_wbull_aft$scale) 
+koeff_wbull_ph
+koeff_wbull_hr = exp(koeff_wbull_ph)
+koeff_wbull_hr
+```
+
+Invesitutre øker sjansen for regjeringsfall med 1-1.54 = 54 %. 
+
+```{r}
+KABL.weib.Ihat<-predict(model_wbull_aft,newdata=as.data.frame(FakeInvest),
+                        type="quantile",se.fit=TRUE,p=seq(.01,.99,by=.01))
+
+KABL.weib.NoIhat<-predict(model_wbull_aft,newdata=as.data.frame(FakeNoInvest),
+                          type="quantile",se.fit=TRUE,p=seq(.01,.99,by=.01))
+
+# Plot:
+
+plot(KABL.weib.NoIhat$fit,seq(.99,.01,by=-.01),t="l",lwd=3,col="green",
+     xlab="Time (in months)",ylab="Survival Probability")
+lines(KABL.weib.Ihat$fit,seq(.99,.01,by=-.01),lwd=3,col="red")
+lines(KABL.weib.NoIhat$fit+1.96*(KABL.weib.NoIhat$se),
+      seq(.99,.01,by=-.01),lty=2,lwd=1,col="green")
+lines(KABL.weib.NoIhat$fit-1.96*(KABL.weib.NoIhat$se),
+      seq(.99,.01,by=-.01),lty=2,lwd=1,col="green")
+lines(KABL.weib.Ihat$fit+1.96*(KABL.weib.NoIhat$se),
+      seq(.99,.01,by=-.01),lty=2,lwd=1,col="red")
+lines(KABL.weib.Ihat$fit-1.96*(KABL.weib.NoIhat$se),
+      seq(.99,.01,by=-.01),lty=2,lwd=1,col="red")
+legend("topright",inset=0.05,bty="n",
+       c("Investiture Requirement","No Investiture Requirement"),
+       lty=c(1,1),lwd=c(2,2),col=c("red","green"))
+
+```
+
+Det finnes en Weibull-modell-kult, og mange varianter av dette.
+
+##Gompertz-modell (slide 29)
+En helt fin modell, men som ikke brukes så mye som Weibull - selv om de er temmelig like. Det er en modell hvor hasarden endes monotont over tid, og endringsraten estimeres fra data.
+
+Hvis gamma er større enn 0, går h(t) opp, hvis gamme er mindre enn 0, går h(t) ned. hvis lik 0 er h(t) lik exp(lamda). Dermed lik weibull i noen tilfeller.
+
+```{r}
+t<-cbind(1:1000,1:1000,1:1000)
+t<-t/100
+G<-c(-0.5,0,0.1)
+GompertzHs<-t(apply(t,1,function(t) exp(0.2)*exp(G*t)))
+
+# Plot:
+plot(t[,1],GompertzHs[,1],t="l",lwd=3,lty=1,col="green",
+     xlab="Time",ylab="Hazard",ylim=c(0,4))
+lines(t[,2],GompertzHs[,2],lwd=3,lty=2,col="black")
+lines(t[,3],GompertzHs[,3],lwd=3,lty=3,col="red")
+legend("topleft",inset=.02,
+       c("gamma = -0.5","gamma = 0","gamma = 0.2"),
+       lty=c(1,2,3),lwd=c(3,3,3),col=c("green","black","red"),
+       cex=1.2,bty="n")
+```
+
+Dette er ikke en AFT-modell, kun hasardrate-modell (?).
+
+```{r}
+model_gomp = flexsurvreg(modell,data=df,dist="gompertz")
+model_gomp
+```
+
+##Log-logistic model (slide 33)
+Men hva hvis hasard-raten er lav, stiger, og så faller? F.eks. ved beslutninger om å endre lover som oppfølging av høyesterettsvedtak?
+
+Det gir en S(t) som likner på en logistisk kurve. Har en ekstra parameter p, som er en invers av skaleringsparametre og invers av hasard. Noen eksempler for ulike p-verdier:
+
+```{r}
+t<-cbind(1:100,1:100,1:100)
+t<-t/2
+p<-c(0.5,1.0,3.0)
+LogLogHs<-t(apply(t,1,function(t) (0.05*p*((0.05*t)^(p-1)))/(1+(0.05*t)^p)))
+
+# Plot:
+plot(t[,1],LogLogHs[,1],t="l",lwd=3,lty=1,col="green",
+     xlab="Time",ylab="Hazard",ylim=c(0,0.15))
+lines(t[,2],LogLogHs[,2],lwd=3,lty=2,col="black")
+lines(t[,3],LogLogHs[,3],lwd=3,lty=3,col="red")
+legend("topright",inset=.02,
+       c("p = 0.5","p = 1.0","p = 3.0"),
+       lty=c(1,2,3),lwd=c(3,3,3),col=c("green","black","red"),
+       cex=1.2,bty="n")
+```
+
+Eksempelet fra R er igjen AFT. p kan utledes som 1/scale i eksempelet. Men koeffisientene her kan ikke tolkes som hasardrater - det er kun en AFT-modell. (OBSOBS.)
+
+```{r}
+# KABL Log-Logistic:
+model_loglog = survreg(modell,data=df,dist="loglogistic")
+summary(model_loglog)
+```
+
+##Noen andre:
+Log-logistisk og log-normal er liknende, men antar ulike fordelinger av feilleddet (logistisk og normal) - og likner da også på t.
+
+Generalisert gamma: Tre parametre - baseline lamdba (hasard), hasard-form (p), og en tredje, som gir nok en form på hasard. Det gir enda en annen form på hasarden. Hvis p og 3 parametre = 1, så er det eksponentiell, hvis p = 1 så er det Weibull. 
+
+Hvis dette er en mer generalisert form, hvorfor ikke bare bruke det? Fordi den er vanskelig å forstå og vanskelig å "fitte" (hva er det norske ordet her?) - du får gjerne større problemer enn du løser.
+
+##Hvordan velge riktig fordeling for en parametrisk survival-modell?
+Hva veit du om fordelinga av hasard-raten for det du modellerer, i den faktiske populasjonen du er interesert i å si noe om? 
+
+Dette er enda et valg du må ta, i tillegg til øvrige modelleringsvalg. Og hvor alvorlig en slik feil er, er vanskelig å si.
+
+Du kan starte med en mer parametrisert modell, og så gå ned i modell-rekka til mindre parametriserte modeller. Eller: gå over til cox-modellering som kommer lenger ned.
+
+##Software-kommentar
+Parametriske modeller i R håndterer tidsvarierende data svært dårlig. Da må du bruke Cox. Se slide 38. STATA er bedre. Skyldes forskjeller mellom disipliner - Cox er populært i biostats, parametriske modeller er populært i ingeniør-kretser.
+
+#Cox og diskret tid-modeller
+Grunnleggende ide: 
+- Hvert individ i har en baseline-hasard, og 
+- en hasard-rate proporsjonalt skalert av en vektor X (proporsjonalt fordi exp(X)).
+
+S(t) synker fortere med større verdier av exp(X). 
+
+Utleder en modell uten å gjøre distribusjons-antakelser. Utleder en sannsynlighet for at en person opplever en hendelse på et tidspunkt (med en antakelse om at ingen hendelser skjer samtidig). Bygger igjen en utledning av partial likelihood for en hendelse på et tidspunkt. Denne modellen tar også med sensurert informasjon, så lenge disse er i settet av individer med risiko for hendelse.
+
+Gir konsistente estimater, er asymptotisk normalfordelt, og litt ineffektivt sammenliknet med en velfungerende parametrisk modell.
+
+En parametrisk modell gjør en antakelse om fordelinga av hasard over tid (med basis i en sannsynlighetsfordeling), og bruker observerte varigheter for å estimere koeffisienter m.v. Dvs. at når tid-til-hendelse skifter, skifter modell-estimatene.
+
+Cox-modellen bryr seg om sorteringa av hendelser, ikke den faktiske varigheten / tiden-til-hendelse: hva er sannsynligheten for at det var enhet A som hadde hendelsen på tidspunkt t. Og med uendelig observasjoner, lærer du like mye av rangering som av tid til hendelse. En kobling til rang-basert statistikk. Så hvis du skifter rekkefølge på observasjoner, vil koeffisientene skifte. 
+
+Antakelse: ingen hendelse skjer på samme tidspunkt (fordi da kan du ikke si noe om rangeringa). Det er potensielt vanskelig.
+
+Eksempel med tidsvarierende data på krig mellom stater (et klassisk treningseksempel for statsvitenskap). 
+
+(Dyadene er også avhengig av hverandre - Pakistan vil ikke ha krig på flere fronter, så hvis krig ett sted. Det gir nettverkseffekter innad i variablene).
+
+```{r}
+df = read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/OR.csv")
+summary(df)
+
+# Surv object...
+objekt_surv =  Surv(df$start,df$stop,df$dispute,type=c('counting'))
+model_km = survfit(objekt_surv~1)
+
+# Kaplan-Meier:
+
+plot(model_km,mark.time=FALSE,lwd=c(2,1,1),
+     xlab="Time (in years)",ylab="Survival Probability")
+
+model_cox = coxph(objekt_surv~allies+contig+capratio+growth+democracy+trade,
+                data=df,na.action=na.exclude, method="breslow")
+summary(model_cox)
+```
+
+
+Tolkning av koeffisienter: exp(coef)
+
+- Land som er allierte har en forventa (0,706-1)*100 = 29,4 % lavere hasard for konflikt, enn de som ikke er allierte
+- Land som ligger ved siden hverandre har en (2,582-1)*100  = 158 % høyere hasard for konflikt enn ikke-vedsidenavhverandre
+- En en-enhets-økning i demokrati tilsvarer en (0,683-1)*100 = 31,7 % nedgang i forventa hasard for konflikt.
+
+Med eksempelet fra "growth" her: en enhets endring i growth = 100 % endring i GDP. ikke interessant. Bruk skalaer der 1 enhet endring gir mening.
+
+```{r}
+df$growthPct = df$growth*100
+summary(coxph(objekt_surv~allies+contig+capratio+growthPct+democracy+trade,
+                data=df,na.action=na.exclude, method="breslow"))
+```
+
+- Første formulering viste at en enhets økning i vekst (100% vekst) ga 97,5 % nedgang i hasarden
+- Andre formulering er nå at en enhets økning (1%) gir 4 % nedgang i hasarden
+- Dette er proporsjonalt det samme - 0.96373^100 = 0.02485
+
+Cox-modellen har ingen konstant. 
+
+Ettersom den er uparametrisk og ikke definerer hasard-kurven (eller survival-kurve). Vi antar at alle har en baseline-hasard som er en konstant (men ikke estimeres? Eller er implisitt av modellen? Ah - det er en konstant, og lik for alle - ikke baseline-risiko, dette er relative hasardrater). Det sier ingenting om baserate-sjanse for en hendelse. Men cox-outputen kan brukes til å generere en baseline (integrert) hazard, som kan tolkes relativt til en lineær hasard (45 graders linje).
+
+```{r}
+baseline_cox = basehaz(model_cox,centered=FALSE)
+
+# Plot:
+
+plot(baseline_cox$time,baseline_cox$hazard,t="l",lwd=4,col="red",
+     xlab="Time (in years)",ylab="Baseline Integrated Hazard")
+lines(abline(lm(baseline_cox$hazard~0+baseline_cox$time),lty=2,lwd=2))
+legend("bottomright",inset=0.02,bty="n",
+       c("Baseline Hazard","Linear Fit"),lty=c(1,2),
+       lwd=c(4,2),col=c("red","black"))
+```
+
+Samme som parametriske modeller, kan Cox også brukes til å sammenlikne S(t) for spesifikke kombinasjoner av verdier.
+
+```{r}
+# Comparing survival curves:
+
+FakeContig<-as.data.frame(t(c(mean(df$allies),1,mean(df$capratio),mean(df$growth),
+              mean(df$democracy),mean(df$trade))))
+FakeApart<-as.data.frame(t(c(mean(df$allies),0,mean(df$capratio),mean(df$growth),
+              mean(df$democracy),mean(df$trade))))
+colnames(FakeContig)<-c("allies","contig","capratio","growth",
+                        "democracy","trade")
+colnames(FakeApart)<-c("allies","contig","capratio","growth",
+                        "democracy","trade")
+
+FCHat<-survfit(model_cox,FakeContig)
+FAHat<-survfit(model_cox,FakeApart)
+
+# Plot:
+
+plot(FAHat,col=c(rep("black",times=3)),lwd=c(3,1,1),lty=c(1,2,2),
+     xlab="Time (in years)",ylab="Survival Probability",
+     mark.time=FALSE)
+par(new=TRUE)
+plot(FCHat,col=c(rep("red",times=3)),lwd=c(3,1,1),lty=c(2,2,2),
+     mark.time=FALSE)
+legend("bottomleft",inset=0.02,bty="n",
+       c("Non-Contiguous","Contiguous"),lty=c(1,2),
+       lwd=c(3,3),col=c("black","red"))
+```
+
+##Sammenfallende hendelser - ties
+P.g.a. særlig diskretisering i data har vi hendelser som sammenfaller i tid. Dette  gir problemer og gjør at betakoeffisienter nærmer seg 0 (fordi når du legger til hendelser på samme tidspunkt, får du ikke ny informasjon - bare mer. Hvis alle er på samme tid, har du en konstant uten variasjon)
+
+(Dette er absolutt et problem for intro-dato: nesten alle slutter etter to år). 
+
+Løsning: 
+- Cox hadde også tenkt på det, en eksakt måte å gjøre det på hvor du modellerer alle mulige utfall av sammenfall, og fordeler utfall deretter. På 70-tallet krevde det veldig mye regnekraft - og fortsatt litt for store datsett.
+- Breslows tilnærming til å løse dette var en slags empirisk justering underveis - men er dårlig for data med mange sammenfall. 
+- Efron foreslår en avansert måte å legge til litt støy på hver tilfelle, tilfeldig. 
+
+(Eksempel)
+1. eksempel der alle har ulike tid.
+2. om lag 40 % sammenfall på t. Den faktiske koeffisienten er ikke lenger 1 - og Zorn mener exact er best.
+
+```{r}
+Data = as.data.frame(cbind(c(rep(1,times=400)),c(rep(c(0,1),times=200))))
+colnames(Data)<-c("C","X")
+Data$T<-rexp(400,exp(0+1*Data$X)) # B = 1.0
+Data.S<-Surv(Data$T,Data$C)
+
+D.br<-coxph(Data.S~X,data=Data,method="breslow")
+D.ef<-coxph(Data.S~X,data=Data,method="efron")
+D.ex<-coxph(Data.S~X,data=Data,method="exact")
+
+D.Bs<-c(D.br$coefficients,D.ef$coefficients,D.ex$coefficients)
+Dlab<-c("Breslow","Efron","Exact")
+
+# Plot:
+dotchart(D.Bs,labels=Dlab,pch=19,cex=1.8,xlab="Estimated Beta")
+
+# Now add ties via rounding (nearest multiple of 5):
+Data$Tied<-round(Data$T,0)
+DataT.S<-Surv(Data$Tied,Data$C)
+
+DT.br<-coxph(DataT.S~X,data=Data,method="breslow")
+DT.ef<-coxph(DataT.S~X,data=Data,method="efron")
+DT.ex<-coxph(DataT.S~X,data=Data,method="exact")
+DT.Bs<-c(DT.br$coefficients,DT.ef$coefficients,DT.ex$coefficients)
+
+#Plot:
+dotchart(DT.Bs,labels=Dlab,pch=19,xlab="Estimated Beta",
+         cex=1.8)
+abline(v=D.ex$coefficients,lty=2,lwd=2)
+```
+
+
+"Hvis du har mindre enn 10 % sammenfall, betyr det ingenting" - men ingen kilde. Hva betyr det? 10 % med samme tid? 10% deler tid med minst 1 annen hendelse? Zorn mfl. jobber på et paper om dette.
+
+Sjekk hva som er standard i din programvare!
+
+##Modellvalg
+- Parametrisk modell gjør det lettere å gjøre out-of-sample predictions. Vi kjenner kurven. Antakelsen gir oss noe å jobbe med.
+- Cox-modellen bryr seg ikke om tidspunkt hvor det ikke skjer hendelser. Så vanskelig å brke om tidspunkt hvor det ikke skjer hendelser. Men du tar ikke feil på fordelinga.
+
+Så:
+1. Sier teorien noe om fordelinga av h(t)? Veit vi ellers noe om h(t)?
+2. Bryr vi oss om bias? Hvis vi driver med legemidler - ja, vi vil ha presise estimater av effekt, og vi har en del data. Velg Cox. (Kan også forklare hvorfor Cox er populært i medisin og biostat)
+3. Eller bryr vi oss om effektivitet og prediksjoner? Dvs. at du får mest mulig ut av de få observasjonen du har, men forstår prosessen bak bedre? I så fall kan du velge parametrisk. (Kan også forklare hvorfor Weibull er populær blant ingeniører)
+
+Når du tenker om fordelinga av variabelen, husk forskjellen mellom fordelinga av Y ukondisjonelt, og fordelinga av Y kondisjonelt på X. F.eks. hvordan inntekt over tid ser ut reint, og hvordan det ser ut etter at du har tatt ut kjønnsforskjeller.  De kan være ganske forskjellige.
+
+#Diskret tid
+Begrenset utfallsrom for t (som f.eks. hvor gammel en er ved konfirmasjon)
+
+(når er noe faktisk diskret? Skjønnsspørsmål, antakeligvis)
+
+FUnksjonsutledningen er ganske grei, mer opptelling, samme logikk (Yit = Cit). 
+
+##Løsning 1: ordinal regresjon
+Hvis du har lite data (si 5 ulike tidspunkt), kan du bruke en ordinal logitstisk regresjon for kategoriske data. 
+
+##Løsning 2: logistisk regresjon panel-data-style AKA grupperte data varighetsmodeller
+Mer vanlig er det at du er interessert i og modellerer et binært utfall - typisk hendelsen. Binary TSCS. Dette kan også modelleres med  probit/logit, med eller uten FE/RE, kanskje også GEE. Dette har noen fordeler. Viktigst er det at det er lett å tolke, lett å kjøre.
+
+Må håndtere - dvs. modellere - tidsavhengighet eksplisitt. Hvis du bare kjører en logistisk regresjon på tidsdata med 1 og 0, antar du at baseline-hasard er flat - rekkefølgen i t tas ikke hensyn til. Dette er samme antakelse som for parametrisk eksponentiell fordeling. Og da må du vite at dette skjer.
+
+```{r}
+model_logit = glm(dispute~allies+contig+capratio+growth+democracy+trade,
+              data=df,na.action=na.exclude,family="binomial")
+summary(model_logit)
+```
+
+Hvis du legger til et tidsledd, adresseres det. Det kan legges til som et parameter som likner på Weibull (slide 39), eller polynomer, eller splines...til ekstremtilfellet, med dummyvariabler for alle tidspunkt t. Full fleksibilitet, som likner på Cox-modellen. Dvs. at vi bruker mye data, mulig overfitting for prediksjon. Splines: Små tidseffekter. BKT nevner cubic splines som et eksempel, alle tok det som en obligatorisk teknikk etter BKT-artikkelen.
+
+Lineær tidstrend:
+```{r}
+df$duration = df$stop
+
+modell_trend<-glm(dispute~allies+contig+capratio+growth+democracy+trade+duration,
+                  data=df,na.action=na.exclude,family="binomial")
+summary(modell_trend)
+```
+
+Fjerde-ordens-polynomial trend:
+
+```{r}
+df$d2<-df$duration^2*0.1
+df$d3<-df$duration^3*0.01
+df$d4<-df$duration^4*0.001
+
+modell_p4 = glm(dispute~allies+contig+capratio+growth+democracy+trade+duration+d2+d3+d4,
+           data=df,na.action=na.exclude,family="binomial")
+summary(modell_p4)
+```
+
+Hvorvidt polynom-modellen var en forbedring kan testes med anova:
+
+```{r}
+test = anova(model_logit,modell_p4,test="Chisq")
+test
+
+```
+
+Tidsdummyer:
+
+```{r}
+modell_dummy = glm(dispute~allies+contig+capratio+growth+democracy+trade+as.factor(duration),
+              data=df,na.action=na.exclude,family="binomial")
+summary(modell_dummy)
+
+test_dummy = anova(model_logit,modell_dummy,test="Chisq")
+test_dummy
+```
+
+En kan se på predikerte hasarder for å sammenlikne ulike tidstilnærminger:
+
+```{r}
+Xhats<-as.data.frame(t(c(mean(df$allies),mean(df$contig),mean(df$capratio),
+                         mean(df$growth),mean(df$democracy),mean(df$trade))))
+Xhats<-Xhats[rep(1:nrow(Xhats),each=max(df$duration)),]
+Xhats$duration<-1:max(df$duration)        
+Xhats$d2<-Xhats$duration^2*0.1
+Xhats$d3<-Xhats$duration^3*0.01
+Xhats$d4<-Xhats$duration^4*0.001
+colnames(Xhats)<-c("allies","contig","capratio","growth","democracy",
+                   "trade","duration","d2","d3","d4")
+
+Hat.logit<-predict(model_logit,Xhats,type="response")
+Hat.trend<-predict(modell_trend,Xhats,type="response")
+Hat.P4<-predict(modell_p4,Xhats,type="response")
+Hat.dummy<-predict(modell_dummy,Xhats,type="response")
+
+plot(Xhats$duration,Hat.logit,ylim=c(0,0.04),t="l",lwd=3,col="black",
+     xlab="Time (in years)",ylab="Predicted Probability")
+lines(Xhats$duration,Hat.trend,lwd=3,lty=2,col="blue")
+lines(Xhats$duration,Hat.P4,lwd=3,lty=3,col="green")
+lines(Xhats$duration,Hat.dummy,lwd=3,lty=4,col="red")
+legend("topright",inset=0.05,bty="n",
+       c("No Duration Dependence","Linear Dependence",
+         "Fourth-Degree Polynomial","Duration Dummies"),lty=c(1,2,3,4),
+       lwd=c(3,3,3,3),col=c("black","blue","green","red"))
+
+```
+
+Hvordan velge løsning på tid? 
+- Teoretisk begrunnelse, 
+- teste fra generell til spesifikk modell, 
+- sammenlikne fitted values for modellspesifisering med kryssvalidering.
+
+Zorn anbefaler kombinasjon av teori og kryssvalidering. Slide 51 har eksempler på prediksjonstesting.
+
+##Cox-modeller er grupperte data varighetsmodeller
+i markedsføringsforskning ser en på multinomisk regresjon på valg hos velgeren, og alternativer ved valget. Fixed effects for valget brukes gjerne. Så hvis valget er hendelsen, er kondisjonelle logit-modeller cox-modeller (HM?). Og mer generelt: grupperte data varighetsmodeller er cox-modeller, eller i hvert fall: de er liknende/proporsjonale.
+
+Så noen eksempler på modellestimering.
+
+Eksempelet på slide 52: for at poisson skal være lik cox, må cox ha breslow-metode ved ties, og poisson må ha tids-dummyer for alle år.
+
+```{r}
+modell_cox = coxph(Surv(df$start,df$stop,df$dispute)~allies+contig+capratio+growth+democracy+trade,
+                   data=df,method="breslow")
+
+modell_poisson = glm(dispute~allies+contig+capratio+growth+democracy+trade+as.factor(duration),
+                data=df,na.action=na.exclude,family="poisson")
+
+plot(modell_cox$coefficients[1:6],modell_poisson$coefficients[2:7],pch=19,
+     xlab="Cox Estimates",ylab="Poisson Estimates",
+     xlim=c(-4,1.5),ylim=c(-4,1.5))
+abline(0,1)
+text(modell_cox$coefficients[1:6],modell_poisson$coefficients[2:7],
+     labels=colnames(Xhats[1:6]),pos=4,cex=0.8)
+legend("bottomright",bty="n",inset=0.02,c("Line is 45-degree line"))
+```
+
+#Utvidelse til overlevelsesanalyse: 
+Følgende temaer er ikke dekket:
+
+- varighetsavhengighet, dvs. at hasarden stiger eller synker som funksjon av tid, eller uobserverte variabler.
+- brudd på proposjonalitetsantakelsen i Cox-modellen (æsj). Kan håndteres med tidsinteraksjoner (med tid eller log(tid)).
+- konkurrende risiko-modeller med flere avhengige utfall. Ganske rett fram, største spørsmål er om de ulike utfallene er uavhengig. Ofte kan de gjøres uavhengig ved å kontrollere/modellere riktig.
+- gjentakende hendelser: observasjoner som går inn og ut av risikogruppa/flere utfall (f.eks. inn og ut av arbeid flere ganger. ekteskap.). Hvor ofte kan hendelsen skje? Hvordan påvirkes hasarden post-hendelse? Hvis du har vært i jobb, har du da høyere/lavere hasard for mer jobb?
+
+(Zorn legger ut kode og slides på dette på GitHub - sa han. Mulig det må etterspørres hvis det er behov)
+
+Det som derimot ble diskutert var "cure models" og "frailty-models"
+
+##Cure models
+En implisitt antakelse i all regresjonsanalyse er at når du har lagt inn modelleringa di, med X og evt. enhetseffekter, så er Y tilfeldig fordelt. Observasjonene er mer eller mindre utvekslbare - exchangeability. Dette er ikke nødvendigvis sant.
+
+Alle observasjoner vil før eller seinere oppleve hendelsen.
+
+Eksempel: testing av medisin, der noen får medisin og noen får placebo, og så måler en tid til tilbakefall. Noen blir kurert, og vil aldri oppleve hendelsen igjen - enten pga medisin, eller "selv-kurering". Noen dør av sykdom, noen dør av andre ting og blir sensurert.
+
+Det er to varianter av cure models: miksturkur og ikke-miksturkur.
+
+###miksturkur-modell (Mixture cure model)
+Kalles mikstur-modell fordi to grupper - kurerte og ikke-kurerte - mikses, med mikse-parameteret delta.
+
+Variabelen for personer som vil oppleve hendelsen og ikke oppleve hendelsen er latent. Den kan ikke observeres. Men vi kan beregne en sannsynlighet for om en person er i den gruppa. Slide 4 viser hvordan dette gir en S(t) som har en nedre verdi som ikke er 0 - det er en nedre verdi der de som ikke er på risiko. "Likelihood"-utledninga er lik som for andre data, men betinget på at risiko-settet er begrensa.
+
+Sensurering er annerledes: Du kan enten være sensurert, eller kurert. Dvs. at sannsynigheten for at du ikke får hendelsen er sannsynligheten for at du er kurert + sannsynlighet for at hendelsen kommer etter tidspunkt T/t.
+
+I denne modellen kan du ha kovariater både i X - sannsynlighet for hendelse - og delta - mikseparameteret/sannsynligheten for å være kurert. Modell-estimatet gir også en gammaparameteret, som jeg ikke helt skjønner - men et slags sannsynlgihetsestimat av hvem som er kurert og hvem som ikke er kurert. Det er altså et anslag på en individuell heteregoenitet som vi ikke kjenner. Magisk! (?)
+
+Denne modellen tilsvarer en "zero-inflated Poisson". Større sannsynlighet for å få 0, men du vet ikke noe om det.
+
+Eksempel med simulerte data. Vi simulerer noe data, med en spesifikk fordeling og sammenheng + støy.
+
+```{r}
+X<-rnorm(500)
+Z<-rbinom(500,1,0.5)
+T<-rweibull(500,shape=1.2,scale=1/(exp(0.5+1*X)))
+C<-rbinom(500,1,(0.4-0.3*Z)) # Z increases cure probability
+S<-Surv(T,C)
+
+plot(survfit(S~1),mark.time=FALSE,lwd=c(3,1,1),
+     xlab="Time",ylab="Survival")
+
+coxph(S~X)
+coxph(S~X+Z)
+```
+
+Cox-regresjonen viser en  en mulig effekt av Z, der Z sre ut til å minke hasarden. Men den gjør ikke det, i de simulerte dataene øker de sannsynligheten for å være kurert. Så det er en falsk positiv. Hvis du setter den inn som "cureform", går det bra.
+
+```{r}
+#data.cure<-cbind(X,Z,T,C)
+#data.cure<-data.frame(data.cure)
+#cure.fit<-smcure(S~X,cureform=~Z,data=data.cure,model="ph")
+
+#cure.hat<-predictsmcure(cure.fit,c(rep(mean(X),times=2)),
+#                        c(0,1),model="ph")
+#cure.pic<-plotpredictsmcure(cure.hat,type="S",model="ph",
+#            lwd=c(3,3))
+
+# Plot:
+#plotpredictsmcure(cure.hat,type="S",model="ph",
+#                  lwd=c(3,3),main="Predicted Survival")
+#legend("topright",inset=0.04,bty="n",lty=c(1,2),cex=1.2,
+#      c("X at mean, Z = 0","X at mean, Z = 1"))
+```
+
+smcure er beste R-pakke. Noen eksempler: Eksempel med kur-modell som ikke konvergerte p.g.a. kanskje for lite data. Og så en modell med 60 000 datapunkter. Funka dårlig i R, funka i STATA. Kraftige modeller, men vanskelige.
+
+##Ikke-miksturkur-modell 
+Hvis en pasient har fått strålebehandling, så vil vi vite om det er noen gjenværende kreftceller. Her kan en modellere tiden til nytt kreftutbrudd. Det er en mulighet for at du er kurert, men det er også mulig at det er igjen kreftceller, som trenger tid for å vokse. Overlevelsesfunksjonen S(t) kan utledes som å være Cox, men med en sannsynlighet for at du er kurert. Men du bruker ikke to grupper i data - alle har samme Poisson-fordelte sannsynlighet, men noen får 0 celler, andre får ikke-0. Sannsynligheten for 0 er den samme som den nedre grensa i miksturkur-modellen.
+
+Ikke-kreft-eksempel: opprørsgrupper i et land. Noen land er immune, de har ikke opprør.
+
+Eksempel på slide 11. 
+
+Denne modellen tilsvarer en "hurdle Poisson".
+
+(HM)
+
+Simulert sammenlikning av mikstur og ikke-mikstur:
+
+```{r}
+t<-seq(0.1,50,by=0.1)
+pi<-0.5 # P(cured) = 0.5
+lambda<-0.1
+S.exp<-exp(-(lambda*t))
+S.mix<-pi+((1-pi)*(exp(-lambda*t)))
+S.nomix<-exp(log(pi)*(1-(exp(-lambda*t))))
+
+# Plot:
+
+plot(t,S.exp,t="l",lwd=3,xlab="Time",ylab="Survival",
+     main=expression(paste("Exponential Hazards with ",
+          lambda," = 0.1 and ",pi," = 0.5")))
+lines(t,S.mix,lwd=3,lty=2,col="red")
+lines(t,S.nomix,lwd=3,lty=3,col="blue")
+abline(h=0.5,lty=5,col="grey")
+legend("topright",bty="n",lwd=3,lty=c(1,2,3),
+       col=c("black","red","blue"),
+       c("No Cured Fraction","Mixture Cure","Non-Mixture Cure"))
+
+```
+
+Inkluderer også et eksempel på cure-model i R som ikke gikk så bra:
+
+```{r}
+# Fitting real cure models...sorta.
+
+#CFURL<-"https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/ceasefiresTC.csv"
+#temp<-getURL(CFURL)
+#CF<-read.csv(textConnection(temp))
+#rm(CFURL,temp)
+
+#CF<-CF[complete.cases(CF),]
+
+#CF.S<-Surv(CF$peace,CF$uncensor)
+
+#plot(survfit(CF.S~1),mark.time=FALSE,lwd=c(3,1,1),
+#     xlab="Time (in months)",ylab="Survival")
+
+#CF.cox<-coxph(CF.S~tie+imposed+lndeaths+contig+onedem+twodem,
+#              data=CF,method="efron")
+#CF.cox
+
+#CF.cure1.fit<-smcure(CF.S~tie+lndeaths+imposed,
+#                   cureform=~contig,data=CF,model="ph",
+#                    link="logit",emmax=500)
+# LNB:
+
+#LNBURL<-"https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/LNB.csv"
+#temp<-getURL(LNBURL)
+#LNB<-read.csv(textConnection(temp))
+#rm(LNBURL,temp)
+
+# Deal w/missing data + sort:
+
+#LNB<-LNB[complete.cases(LNB),]
+#LNB<-LNB[order(LNB$dyad,LNB$year),]
+
+#LNB.S<-Surv(LNB$count1-1,LNB$count1,LNB$buofmzmid)
+#LNB.altS<-Surv(LNB$count1,LNB$buofmzmid)
+
+#plot(survfit(LNB.S~1,id=dyad,data=LNB),mark.time=FALSE,lwd=c(3,1,1),
+#     xlab="Time (in years)",ylab="Survival")
+#legend("bottomright",inset=0.04,bty="n",cex=1.2,
+#       c("Kaplan-Meier Survival", "Estimate, Long et al. (2007)"))
+
+#LNB.cox<-coxph(LNB.S~relcap+major+jdem+border+wartime+s_wt_glo+
+#               medarb+noagg+arbcom+organ+milinst+cluster(dyad),
+#               data=LNB,method="breslow")
+#LNB.cox
+
+# # Runs for a long time:
+#LNB.cure<-smcure(LNB.altS~relcap+major+jdem+border+wartime+s_wt_glo+
+#                   medarb+noagg+arbcom+organ+milinst,
+#                   cureform=~border,model="ph",data=LNB)
+
+# # Also does not work:
+# LNB.cure1<-nltm(LNB.S~relcap+major+jdem+border,
+#                 nlt.model="PHPHC",data=LNB)
+
+# Stata code for strsmix:
+# 
+# stset count1, id(episode) f(buofmzmid==1)
+# gen h0=0
+# strsmix major jdem border wartime, bhazard(h0) distribution(weibull) \\\
+#    link(logistic) k1(relcap major jdem border wartime s_wt_glo medarb \\\
+#    noagg arbcom organ milinst)
+```
+
+
+##Fordeler og problemer
+- Mange hendelser har ikke 100 % sannsynlighet for å skje.
+- Vanskelig å skille (empirisk) om noen aldri vil få hendelsen, og hva som påvirker sannsynlighet for hendelse. En kurert observasjon og en sensurert observasjon ser like ut. En mulighet er å plotte overlevelseskurva og se om den har en lang hale som ikke går til 0. Men det ignorerer måleproblemer, ref. intro-dataene som aldri gikk til 0 for maks 3 år i program.
+
+#Frailty models
+Ellers like personer har allikevel en (uobservert) egenskap som gjør dem forskjellige (unit level effects - i overlevelsesanalyse heter disse frailties. Sjaber-effekt?) mu(i) som påvirker en hasard multiplikativt. Det gir en eksponentiel effekt på overlevelsesfunksjonen, større verdi gir kortere overlevelestid.
+
+(Mulig dumt spørsmål: Når er noe en uavhengig variabel, og når er noe en frailty?)
+
+Et simulert eksempel: Tid trekkes fra eksponential-fordelinga, for å gi en flat hasard. Grupper lagd først, så individer innafor hver gruppe med konstant frailty/gruppe-effekt.
+
+```{r}
+G<-1:40        # "groups"
+F<-rnorm(40)   # frailties
+data<-data.frame(cbind(G,F))
+data<-data[rep(1:nrow(data),each=20),]
+data$X<-rbinom(nrow(data),1,0.5)
+data$T<-rexp(nrow(data),rate=exp(0+1*data$X+(2*data$F)))
+data$C<-rbinom(nrow(data),1,0.5)
+data<-data[order(data$F),]
+
+S<-Surv(data$T,data$C)
+
+Fcolors<-diverge_hcl(length(F))[rank(F)]
+
+plot(survfit(S~strata(data$G)),col=Fcolors,mark=20,
+     xlab="ln(Time)",ylab="Survival",log="x",xlim=c(0.0001,100))
+legend("bottomleft",bty="n",cex=0.9,inset=0,
+       c("Reds indicate strata","with larger frailties;",
+         "blues with smaller ones"))
+```
+
+Plottet viser at frailty er viktig. Hva om du ikke inkluderer frailty? Frailty er uavhengig av variablene, og burde ikke påvirke modellen. Men den gjør det: underestimerer effekten. Det skyldes seleksjon - de som er igjen har lengre S(t).
+
+Dette kan plugges inn i en cox-funksjon - eller en parametrisk weibull-modell. 
+
+```{r}
+cox.noF<-coxph(S~X,data=data)
+summary(cox.noF)
+
+weib.noF<-survreg(S~X,data=data,dist="weib")
+summary(weib.noF)
+```
+
+Hva med weibull? Vel, koeffisienter er riktig, men scale-parameteret tolkes 1/1.92, som antyder at hasarden går ned.. Og det gjør den ikke. 
+
+I bunn og grunn: hvis du har feil modell, får du feil svar.
+
+Men for å kunne estimere det, må vi anta noe om fordelinga: I overlevelsesmodeller er det svært sjeldent å bruke fixed effects, en bruker random - der en trekker tilfeldige, sentrert på 1, og med positiv variasjon. Hvilken fordeling kan en da velge?  vanligere er 
+
+- gamma. Theta-parameteret (variasjon) inngår så i den nye overlevelsesfunksjonen. Jo større variasjoner i gamma-fordelinga av frailties, jo større variabilitet.
+- inverse-gaussian. Mer kompleks, men gir et liknende forhold der variasjonen i frailties påvirker variasjonen i overleelsfunksjonen.
+
+Praktiske ting: Vanskelig, iterativ greie. Den fulle informasjonsmatrisa har masse data (kvadratet av antall enheter/grupper + variabler). E-M var brukt først, penalized likelihood nå.
+
+```{r}
+cox.F<-coxph(S~X+frailty.gaussian(F),data=data)
+summary(cox.F)
+
+weib.F<-survreg(S~X+frailty.gaussian(F),data=data,dist="weib")
+summary(weib.F)
+```
+
+Tolkning av variance of random effects: grad av variasjon i S(t) som en funksjon av frailities.
+
+Når vi inkluderer enhetseffekter, så blir modellen kondisjonell på disse enhetseffekter. Dvs. at vi får individuelle/enhets-nivå-funksjoner. Du kan også utlede en populasjonsgjennomsnittsmodell, der du bruker gjennomsnittet for enhets-effekter/frailities i beregning av overlevelse.
+
+Tolkning: Enten bruke theta og snittet til å integrere deg fram til et populasjonssnitt, eller estimere for spesifikke grupper eller et gjennomsnitt 1. Pakker: survival, coxme, frailtypack.
+(Spørsmål: RCT der en gruppe får medisin eller ikke-medisin, og data er overlevelsesdata. Randomiseringa skal håndtere ting, slik at medisinen er ortogonal til alle andre variabler. Dvs. at enhetseffekt-leddet også skal være ukorrelert med X, og dermed kan en bruke random effects. Hvorfor? Bør du ikke kunne ignorert enhetseffektene også, siden de ikke påvirker X? Nei. Hvis du bruker et hasard-rammeverk, og tar ut observasjoner etter hvert som de får hendelsen, vil datasettet etter hvert bestå av folk som har en lavere hasard - uten at det nødvendigvis har noe med hasarden for hendelsen)
+
+###Eksempel fra hjemme-oppgave!
+```{r}
+lead<-read.csv("https://raw.githubusercontent.com/PrisonRodeo/GSERM-Oslo-2019-git/master/Data/leaders.csv")
+
+lead<-lead[lead$year<2004,]
+lead.S<-Surv(lead$tenstart,lead$tenure,lead$tenureend)
+
+Rs<-as.matrix(lead[,13:17])
+lead$region<-factor((Rs %*% 1:ncol(Rs))+1,
+                    labels=c("NorthAm",colnames(Rs)))
+rm(Rs)
+
+lead.F<-coxph(lead.S~female*region+frailty.gamma(ccode),data=lead) #versjonen med gamma(leadid) krasjer?
+summary(lead.F)
+```
+
+```{r}
+#plot(survfit(lead.F,se.fit=TRUE),conf.int=TRUE,mark.time=FALSE,
+#     log="x",lwd=c(2,1,1),col="red",xlab="Time (in days)",
+#     ylab="Survival")
+#lines(survfit(lead.S~1),conf.int=FALSE,col="black",
+#      mark.time=FALSE,lwd=2)
+#legend("bottomleft",bty="n",inset=0.04,lty=1,lwd=3,col=c("red","black"),
+#       c("Predicted Survival","Baseline (Univariate) Survival"))
+```
+
+
+- interkasjon mellom kvinne og region. For å tolke disse: legg coeff sammen og exp? 
+- frailty-ledd for leder-ID funker ikke, men det funker for land. Men gir det substansiell mening?
+-> Her kommer bomba. Inner loop er betakoeffisienter for en spesifikk theta-verdi i en gamma-fordeling. Det var ti ytre forsøk, så det bør gå bra.
+- bruker log-skala for x-aksen med tid. sammenlikner baseline med predikert overlevelse (for hvilken gruppe? Ellr er det et popiulasjonssnitt?)
+
+- fall i kurven henger sammen med diskrete hendelser/datotilfeleler: folk slutter etter 1 år, 4 år-
+
+-> Så dette impliserer mixed effects-overlevelsesmodeller. coxme i R. Eksempel! 
+
+```{r}
+lead.coxME<-coxme(lead.S~female + (1 | ccode/female),data=lead)
+lead.coxME
+```
+
+
+Tolk fixed effects som et snitt for female, og random effect st.dev som variasjon rundt den effekten
+
+Tror Zorn prøver å dytte oss.
+
+- Stratifisering: Hver gruppe har en ulik baseline/konstantledd
+- Frailties: Hver gruppe har en varierende, random effekt
+- Robuste slutninger / cluster: GEE/PCSE, som korrigerer for feilstruktur etter estimering.
+
+Gir alt mening? Ikke i alle tilfeller. En overlevelseskurve for hvert land? Kanskje.
+
+Wald-test vs. likelihood og logrank: sistnevnte anbefaler uavhengighet mellom individer i grupper. Men når du begynner å clustre ting, vil du sjå forskjeller i testene her.
+
+En cluster-tilnærming impliserer en GEE, fordi det klustrer standardfeil, robuste standardfeil. En frailtiy-tilnærming er en enhets-tilnærming. Disse to kan ikke kombineres. Se slide 57 og 58.
+
+```{r}
+# Stratified vs. Frailty, etc.
+plot(survfit(lead.S~1,id=leadid,data=lead),mark.time=FALSE,lwd=c(3,1,1),
+     xlab="Time (in days)",ylab="Survival",log="x")
+
+
+```
+
+```{r}
+# Plot strata by country
+plot(survfit(lead.S~strata(ccode),id=leadid,data=lead),
+     col=brewer.pal(9,"Set1"),log="x",mark.time=FALSE,
+     xlab="Time (in days)", ylab="Survival")
+
+
+```
+
+```{r}
+# Plot strata by region:
+plot(survfit(lead.S~strata(region),id=leadid,data=lead),
+     col=brewer.pal(6,"Set1"),lwd=2,log="x",mark.time=FALSE,
+     xlab="Time (in days)", ylab="Survival")
+legend("bottomleft",inset=0.02,bty="n",col=brewer.pal(6,"Set1"),
+       c("N. America","Latin America","Europe","Africa","Asia",
+         "Middle East"),lty=1,lwd=2)
+```
+
+###Strata + frailty
+```{r}
+lead.Fstrat<-coxph(lead.S~female*strata(region)+
+                     frailty.gamma(ccode),data=lead)
+summary(lead.Fstrat)
+
+```
+
+###Strata + clustering
+```{r}
+#lead.stratCl<-coxph(lead.S~female*strata(region)+
+#                      cluster(ccode),data=lead)
+#summary(lead.stratCl)
+
+# boom
+```
+
+###Frailty + clustering
+Fraily er en mixed effects, mens cluster gir en GEE - disse kan ikke kombineres.
+
+```{r}
+#lead.FstratCl<-coxph(lead.S~female*strata(region)+frailty.gamma(ccode)+
+#                       cluster(ccode),data=lead)
+```
+
+
+##Enda flere ting som ikke er nevnt på slide 59
+- overlevelses og longitudinell samtidig: både overlevelse/tid-til-hendelse, og en verdi på en anna variabel Y (f.eks. tid til kjøp av TV størrelse Y) (dette høres jo muligens relevant ut for intro - tid til utfall, og det kan være flere ulike utfall? Nei, ikke helt det samme?)
+
+Noen andre tips. 
+
+- simPH skal være en pakke som gir bedre presentasjons-resultater,
+- Statistics in Medicine er et bra tidsskrift med gode, praktiske løsninger,
+- deltakelse på kurset gir en livstids-emailtilgang på å svare på statistikkspørsmål.
